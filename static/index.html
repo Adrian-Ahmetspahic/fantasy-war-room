@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>My Fantasy Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot-live" id="pulse"></span>
+      <h1>Fantasy War Room</h1>
+      <span class="wk" id="weeklabel"></span>
+    </div>
+    <div class="controls">
+      <span class="summary" id="summary"></span>
+      <span class="updated" id="updated"></span>
+      <label class="auto"><input type="checkbox" id="benches"> benches</label>
+      <label class="auto">
+        <input type="checkbox" id="autoref"> auto-refresh
+        <select id="interval">
+          <option value="15">15s</option>
+          <option value="30" selected>30s</option>
+          <option value="60">60s</option>
+        </select>
+      </label>
+      <button id="refresh">Refresh now</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" hidden></div>
+  <main id="grid" class="grid"></main>
+  <footer class="foot">
+    Scores read live from Sleeper &amp; ESPN. Projections &amp; win % are estimates, not advice.
+  </footer>
+
+  <div id="modal" class="modal" hidden>
+    <div class="modal-card">
+      <div class="modal-head">
+        <span class="modal-title" id="modalTitle">League rosters</span>
+        <button id="modalClose" class="modal-close" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

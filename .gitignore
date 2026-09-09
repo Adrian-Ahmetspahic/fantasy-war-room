@@ -1,0 +1,19 @@
+# --- SECRETS: never commit your real config (holds ESPN cookies) ---
+config.json
+
+# caches / generated
+.cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# logs
+*.log
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+.claude/

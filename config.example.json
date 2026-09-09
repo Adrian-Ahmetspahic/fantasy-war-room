@@ -1,0 +1,26 @@
+{
+  "_comment": "Copy this file to config.json and fill in your own values. config.json is git-ignored and stays on your machine.",
+
+  "season": null,
+  "week": null,
+  "_note_season_week": "Leave season/week as null to auto-detect the current NFL week. Set them only to look at a past week.",
+
+  "sleeper": {
+    "username": "YOUR_SLEEPER_USERNAME",
+    "_note": "Easiest option: just your username. The app finds your leagues automatically. OR leave username null and list exact league_ids below.",
+    "league_ids": []
+  },
+
+  "espn": [
+    {
+      "league_id": "111111",
+      "espn_s2": "PASTE_YOUR_ESPN_S2_COOKIE_HERE",
+      "swid": "{PASTE-YOUR-SWID-COOKIE-HERE}"
+    },
+    {
+      "league_id": "222222",
+      "espn_s2": "PASTE_YOUR_ESPN_S2_COOKIE_HERE",
+      "swid": "{PASTE-YOUR-SWID-COOKIE-HERE}"
+    }
+  ]
+}
