@@ -1,5 +1,7 @@
-# --- SECRETS: never commit your real config (holds ESPN cookies) ---
+# --- SECRETS: never commit ---
 config.json
+.env
+.env.*
 
 # caches / generated
 .cache/
@@ -17,3 +19,6 @@ Thumbs.db
 .vscode/
 *.swp
 .claude/
+
+# local analytics snapshots
+data/

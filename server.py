@@ -190,6 +190,39 @@ def build_gamelog(params):
     return fantasy.espn_gamelog(espn_id, season)
 
 
+def build_league_lab(full_id):
+    cfg = load_config()
+    if cfg is None:
+        return {"error": "config.json not found."}
+    if ":" not in full_id:
+        return {"error": "bad league id"}
+    provider, league_id = full_id.split(":", 1)
+    state = fantasy.sleeper_state()
+    season = str(cfg.get("season") or state.get("season"))
+    week = int(cfg.get("week") or state.get("display_week") or state.get("week") or 1)
+    nfl = fantasy.nfl_game_status()
+
+    if provider == "sleeper":
+        players = fantasy.sleeper_players()
+        sl = cfg.get("sleeper") or {}
+        my_uid = sl.get("user_id")
+        if not my_uid and sl.get("username"):
+            try:
+                my_uid = fantasy.sleeper_user_id(sl["username"])
+            except Exception:
+                pass
+        return fantasy.league_lab_sleeper(league_id, my_uid, week, players, nfl)
+
+    if provider == "espn":
+        for lg in cfg.get("espn") or []:
+            if str(lg.get("league_id")) == str(league_id):
+                return fantasy.league_lab_espn(
+                    league_id, lg.get("espn_s2"), lg.get("swid") or lg.get("SWID"),
+                    season, week, nfl)
+        return {"error": "league not found in config"}
+    return {"error": "unknown provider"}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass  # quiet
@@ -236,6 +269,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/player/gamelog":
             try:
                 self._send(200, build_gamelog(parse_qs(parts.query)))
+            except Exception as e:
+                traceback.print_exc()
+                self._send(500, {"error": str(e)})
+            return
+        if path == "/api/league":
+            q = parse_qs(parts.query)
+            try:
+                self._send(200, build_league_lab((q.get("id") or [""])[0]))
             except Exception as e:
                 traceback.print_exc()
                 self._send(500, {"error": str(e)})

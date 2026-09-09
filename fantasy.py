@@ -700,7 +700,7 @@ def fantasycalc_values(num_teams=12, num_qbs=1, ppr=1, dynasty=False):
     hit = _FC_CACHE.get(key)
     if hit and time.time() - hit[0] < 3600:
         return hit[1]
-    idx = {"by_sleeper": {}, "by_espn": {}}
+    idx = {"by_sleeper": {}, "by_espn": {}, "list": []}
     url = (f"https://api.fantasycalc.com/values/current?"
            f"isDynasty={'true' if dynasty else 'false'}"
            f"&numQbs={num_qbs}&numTeams={nt}&ppr={ppr}")
@@ -709,10 +709,16 @@ def fantasycalc_values(num_teams=12, num_qbs=1, ppr=1, dynasty=False):
             pl = it.get("player") or {}
             entry = {"value": it.get("value"), "ovr": it.get("overallRank"),
                      "pos": it.get("positionRank"), "trend": it.get("trend30Day")}
-            if pl.get("sleeperId"):
-                idx["by_sleeper"][str(pl["sleeperId"])] = entry
-            if pl.get("espnId"):
-                idx["by_espn"][str(pl["espnId"])] = entry
+            sid = str(pl["sleeperId"]) if pl.get("sleeperId") else None
+            eid = str(pl["espnId"]) if pl.get("espnId") else None
+            if sid:
+                idx["by_sleeper"][sid] = entry
+            if eid:
+                idx["by_espn"][eid] = entry
+            idx["list"].append({**entry, "name": pl.get("name"),
+                                "position": pl.get("position"),
+                                "team": pl.get("maybeTeam"),
+                                "sleeper_id": sid, "espn_id": eid})
     except Exception as e:
         print(f"[fantasycalc] fetch failed: {e}")
     _FC_CACHE[key] = (time.time(), idx)
@@ -1177,3 +1183,385 @@ def player_profile(espn_id, sleeper_id, team, pos, name, season):
     except Exception as e:
         print(f"[profile] value lookup failed: {e}")
     return result
+
+
+# --------------------------------------------------------------------------
+# League Lab: power rankings, playoff odds, SoS, recap, waivers, buy/sell,
+# vegas edge. Sleeper + ESPN.
+# --------------------------------------------------------------------------
+_STORE_PATH = os.path.join(HERE, "data", "snapshots.json")
+
+
+def _load_store():
+    try:
+        with open(_STORE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_store(d):
+    try:
+        os.makedirs(os.path.dirname(_STORE_PATH), exist_ok=True)
+        with open(_STORE_PATH, "w") as f:
+            json.dump(d, f)
+    except Exception as e:
+        print(f"[store] save failed: {e}")
+
+
+def sleeper_trending(kind="add", limit=25):
+    try:
+        return _get_json(f"{SLEEPER}/players/nfl/trending/add?limit={limit}"
+                         if kind == "add" else
+                         f"{SLEEPER}/players/nfl/trending/drop?limit={limit}")
+    except Exception as e:
+        print(f"[trending] failed: {e}")
+        return []
+
+
+def _vegas_fp(e):
+    """Rough expected fantasy points implied by DraftKings lines."""
+    fp, have = 0.0, False
+    for kind, mult in (("pass_yds", 0.04), ("rush_yds", 0.1), ("rec_yds", 0.1)):
+        if kind in e:
+            L = _implied_line(e[kind])
+            if L:
+                fp += L * mult
+                have = True
+    if e.get("td") is not None:
+        p = _implied_prob(e["td"])
+        if p:
+            fp += p * 6
+            have = True
+    return round(fp, 1) if have else None
+
+
+def _dk_enrich_team(t, dk):
+    for p in (t.get("players") or []) + (t.get("bench") or []):
+        e = dk.get(_norm_name(p.get("name", "")))
+        if e:
+            p["vegas"] = {
+                "td": e.get("td"),
+                "pass": _implied_line(e["pass_yds"]) if "pass_yds" in e else None,
+                "rush": _implied_line(e["rush_yds"]) if "rush_yds" in e else None,
+                "rec": _implied_line(e["rec_yds"]) if "rec_yds" in e else None,
+                "fp": _vegas_fp(e),
+            }
+        else:
+            p["vegas"] = None
+
+
+def nfl_byes(season):
+    """{TEAM: bye_week} for the season, derived from the weekly scoreboard."""
+    path = os.path.join(CACHE_DIR, f"byes_{season}.json")
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < 7 * 86400:
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    allt = set(v for v in ESPN_PRO_TEAM.values() if v)
+    bye = {}
+    for wk in range(4, 15):
+        try:
+            sb = _get_json("https://site.api.espn.com/apis/site/v2/sports/football/"
+                           f"nfl/scoreboard?seasontype=2&week={wk}&dates={season}")
+        except Exception:
+            continue
+        playing = set()
+        for e in sb.get("events", []):
+            for c in (e.get("competitions") or [{}])[0].get("competitors", []):
+                playing.add(canon_team((c.get("team") or {}).get("abbreviation")))
+        if len(playing) < 20:
+            continue
+        for t in allt - playing:
+            bye[t] = wk
+    try:
+        with open(path, "w") as f:
+            json.dump(bye, f)
+    except Exception:
+        pass
+    return bye
+
+
+def _byes_section(teams, byes, cur_week):
+    me = next((t for t in teams if t.get("is_me")), None)
+    if not me:
+        return None
+    weeks = {}
+    for p in (me.get("players") or []) + (me.get("bench") or []):
+        b = byes.get(p.get("team"))
+        if b and b >= cur_week:
+            weeks.setdefault(b, []).append({"name": p["name"], "pos": p.get("pos"),
+                                            "team": p.get("team"), "starter": p.get("starter")})
+    return [{"week": w, "players": weeks[w]} for w in sorted(weeks)]
+
+
+def _sleeper_schedule(league_id, playoff_start):
+    sched = {}
+    for wk in range(1, playoff_start):
+        try:
+            ms = _get_json(f"{SLEEPER}/league/{league_id}/matchups/{wk}")
+        except Exception:
+            continue
+        bym = {}
+        for m in ms:
+            bym.setdefault(m.get("matchup_id"), []).append(m.get("roster_id"))
+        for _, rs in bym.items():
+            if len(rs) == 2:
+                sched.setdefault(rs[0], {})[wk] = rs[1]
+                sched.setdefault(rs[1], {})[wk] = rs[0]
+    return sched
+
+
+def _apply_movement(league_id, cur_week, teams):
+    store = _load_store()
+    key = str(league_id)
+    hist = store.get(key, {})
+    prior = [int(w) for w in hist if int(w) < cur_week]
+    prev = hist[str(max(prior))] if prior else None
+    for t in teams:
+        pr = prev.get(str(t["id"])) if prev else None
+        t["prev_rank"] = pr
+        t["movement"] = (pr - t["strength_rank"]) if pr else 0
+    hist[str(cur_week)] = {str(t["id"]): t["strength_rank"] for t in teams}
+    store[key] = hist
+    _save_store(store)
+
+
+def _sos(teams, schedule, cur_week, playoff_start):
+    val = {t["id"]: (t.get("value_total") or 0) for t in teams}
+    out = []
+    for t in teams:
+        opps = schedule.get(t["id"], {})
+        rem = [val[opps[w]] for w in opps
+               if int(w) >= cur_week and opps[w] in val]
+        out.append({"name": t["name"], "is_me": t.get("is_me"),
+                    "games": len(rem),
+                    "opp_value": round(sum(rem) / len(rem)) if rem else 0})
+    out.sort(key=lambda x: x["opp_value"])
+    for i, o in enumerate(out, 1):
+        o["rank"] = i
+    return out
+
+
+def _recap(teams, schedule, cur_week):
+    if not any((t.get("score") or 0) > 0 for t in teams):
+        return None
+    byid = {t["id"]: t for t in teams}
+    top = max(teams, key=lambda t: t.get("score") or 0)
+    low = min(teams, key=lambda t: t.get("score") or 0)
+    seen, games = set(), []
+    for t in teams:
+        opp = schedule.get(t["id"], {}).get(cur_week)
+        if opp is None or opp not in byid:
+            continue
+        k = tuple(sorted((t["id"], opp)))
+        if k in seen:
+            continue
+        seen.add(k)
+        a, b = byid[t["id"]], byid[opp]
+        games.append((a, b, abs((a.get("score") or 0) - (b.get("score") or 0))))
+
+    def gm(g):
+        return {"a": g[0]["name"], "as": round(g[0].get("score") or 0, 1),
+                "b": g[1]["name"], "bs": round(g[1].get("score") or 0, 1),
+                "margin": round(g[2], 1)}
+    return {
+        "top": {"name": top["name"], "score": round(top.get("score") or 0, 1)},
+        "low": {"name": low["name"], "score": round(low.get("score") or 0, 1)},
+        "blowout": gm(max(games, key=lambda g: g[2])) if games else None,
+        "closest": gm(min(games, key=lambda g: g[2])) if games else None,
+    }
+
+
+def _buy_sell(teams):
+    allp = []
+    for t in teams:
+        for p in (t.get("players") or []) + (t.get("bench") or []):
+            if p.get("value") and p.get("trend") is not None:
+                allp.append({"name": p["name"], "pos": p.get("pos"),
+                             "team": p.get("team"), "value": p["value"],
+                             "trend": p["trend"], "owner": t["name"]})
+    return {
+        "sell": sorted([p for p in allp if p["trend"] > 0],
+                       key=lambda p: -p["trend"])[:10],
+        "buy": sorted([p for p in allp if p["trend"] < 0 and p["value"] >= 1000],
+                      key=lambda p: p["trend"])[:10],
+    }
+
+
+def _vegas_edge(teams):
+    out = []
+    for t in teams:
+        for p in (t.get("players") or []) + (t.get("bench") or []):
+            v, proj = p.get("vegas"), p.get("projected")
+            if v and v.get("fp") is not None and proj is not None:
+                out.append({"name": p["name"], "pos": p.get("pos"),
+                            "team": p.get("team"), "owner": t["name"],
+                            "proj": round(proj, 1), "vegas_fp": v["fp"],
+                            "edge": round(v["fp"] - proj, 1)})
+    out.sort(key=lambda x: -x["edge"])
+    return {"over": out[:8], "under": list(reversed(out[-8:])) if len(out) > 8 else []}
+
+
+def _waivers(teams, fc, trending):
+    rostered = set()
+    for t in teams:
+        for p in (t.get("players") or []) + (t.get("bench") or []):
+            if p.get("sleeper_id"):
+                rostered.add("s" + str(p["sleeper_id"]))
+            if p.get("espn_id"):
+                rostered.add("e" + str(p["espn_id"]))
+    trend_ids = set(str(x.get("player_id")) for x in (trending or []))
+    out = []
+    for e in fc.get("list", []):
+        sid, eid = e.get("sleeper_id"), e.get("espn_id")
+        if (sid and "s" + sid in rostered) or (eid and "e" + eid in rostered):
+            continue
+        if not e.get("value"):
+            continue
+        out.append({"name": e.get("name"), "pos": e.get("position"),
+                    "team": e.get("team"), "value": e["value"],
+                    "trend": e.get("trend"),
+                    "hot": bool(sid and sid in trend_ids)})
+        if len(out) >= 25:
+            break
+    return out
+
+
+def _sim_playoffs(teams, schedule, cur_week, playoff_start, playoff_teams, n=1500):
+    import random
+    strength = {t["id"]: max(t.get("value_total") or 1, 1) for t in teams}
+    base = {t["id"]: t.get("wins", 0) for t in teams}
+    made = {t["id"]: 0 for t in teams}
+    games = []
+    for wk in range(cur_week, playoff_start):
+        seen = set()
+        for tid, opps in schedule.items():
+            opp = opps.get(wk)
+            if opp is None or opp not in strength or tid not in strength:
+                continue
+            k = tuple(sorted((tid, opp)))
+            if k in seen:
+                continue
+            seen.add(k)
+            games.append((tid, opp))
+    ids = list(strength)
+    for _ in range(n):
+        w = dict(base)
+        for a, b in games:
+            if random.random() < strength[a] / (strength[a] + strength[b]):
+                w[a] += 1
+            else:
+                w[b] += 1
+        order = sorted(ids, key=lambda t: (-w[t], -strength[t]))
+        for t in order[:playoff_teams]:
+            made[t] += 1
+    return {t: round(made[t] / n * 100) for t in made}
+
+
+def _assemble_lab(league_id, provider, name, week, teams, schedule,
+                  cur_week, playoff_start, playoff_teams, fc, trending, byes=None):
+    for rank, t in enumerate(sorted(teams, key=lambda x: -(x.get("value_total") or 0)), 1):
+        t["strength_rank"] = rank
+    _apply_movement(league_id, cur_week, teams)
+    playoff = _sim_playoffs(teams, schedule, cur_week, playoff_start, playoff_teams)
+    for t in teams:
+        t["playoff_pct"] = playoff.get(t["id"])
+    keys = ("name", "is_me", "record", "wins", "losses", "ties", "pf", "pa",
+            "value_total", "strength_rank", "prev_rank", "movement", "score",
+            "playoff_pct")
+    standings = sorted(teams, key=lambda x: (-(x.get("wins") or 0), -(x.get("pf") or 0)))
+    return {
+        "provider": provider, "league_name": name, "week": week,
+        "playoff_start": playoff_start, "playoff_teams": playoff_teams,
+        "teams": [{k: t.get(k) for k in keys} for t in standings],
+        "power": [{"name": t["name"], "is_me": t.get("is_me"),
+                   "value_total": t["value_total"], "rank": t["strength_rank"],
+                   "movement": t.get("movement"), "record": t.get("record")}
+                  for t in sorted(teams, key=lambda x: x["strength_rank"])],
+        "sos": _sos(teams, schedule, cur_week, playoff_start),
+        "recap": _recap(teams, schedule, cur_week),
+        "buysell": _buy_sell(teams),
+        "vegas_edge": _vegas_edge(teams),
+        "waivers": _waivers(teams, fc, trending),
+        "byes": _byes_section(teams, byes or {}, cur_week),
+    }
+
+
+def league_lab_sleeper(league_id, my_user_id, week, players, nfl):
+    league, rosters, roster_by_id, user_name, matchups, projections, slots = _sl_common(
+        league_id, week)
+    settings = league.get("settings", {})
+    playoff_start = settings.get("playoff_week_start") or 15
+    playoff_teams = settings.get("playoff_teams") or 6
+    fc = fantasycalc_values(num_teams=len(rosters))
+    dk = dk_props()
+    by_roster = {m["roster_id"]: m for m in matchups}
+    teams = []
+    for r in rosters:
+        m = by_roster.get(r["roster_id"])
+        if not m:
+            continue
+        t = _sl_build_team(m, r, user_name, players, projections, nfl, slots)
+        st = r.get("settings", {})
+        t["id"] = r["roster_id"]
+        t["is_me"] = r.get("owner_id") == my_user_id
+        t["wins"] = st.get("wins", 0)
+        t["losses"] = st.get("losses", 0)
+        t["ties"] = st.get("ties", 0)
+        t["pf"] = round(st.get("fpts", 0) + st.get("fpts_decimal", 0) / 100, 2)
+        t["pa"] = round(st.get("fpts_against", 0) + st.get("fpts_against_decimal", 0) / 100, 2)
+        _fc_enrich_team(t, fc)
+        _dk_enrich_team(t, dk)
+        teams.append(t)
+    schedule = _sleeper_schedule(league_id, playoff_start)
+    byes = nfl_byes(league.get("season"))
+    return _assemble_lab(league_id, "sleeper", league.get("name", "Sleeper league"),
+                         week, teams, schedule, week, playoff_start, playoff_teams,
+                         fc, sleeper_trending(), byes)
+
+
+def league_lab_espn(league_id, espn_s2, swid, season, week, nfl):
+    league = _espn_fetch(league_id, espn_s2, swid, season, week)
+    name = (league.get("settings") or {}).get("name", "ESPN league")
+    ss = ((league.get("settings") or {}).get("scheduleSettings") or {})
+    playoff_teams = ss.get("playoffTeamCount") or 6
+    reg = ss.get("matchupPeriodCount") or 14
+    playoff_start = reg + 1
+    raw_teams = league.get("teams", [])
+    my_id = _espn_my_team_id(league, swid)
+    fc = fantasycalc_values(num_teams=len(raw_teams))
+    dk = dk_props()
+    teams = []
+    for raw in raw_teams:
+        t = _espn_build_team(raw, week, nfl)
+        if not t:
+            continue
+        ov = (raw.get("record") or {}).get("overall", {})
+        t["id"] = raw.get("id")
+        t["is_me"] = raw.get("id") == my_id
+        t["wins"] = ov.get("wins", 0)
+        t["losses"] = ov.get("losses", 0)
+        t["ties"] = ov.get("ties", 0)
+        t["pf"] = round(ov.get("pointsFor", 0), 2)
+        t["pa"] = round(ov.get("pointsAgainst", 0), 2)
+        _fc_enrich_team(t, fc)
+        _dk_enrich_team(t, dk)
+        teams.append(t)
+    # schedule from ESPN's schedule array (regular season only)
+    schedule = {}
+    for g in league.get("schedule", []):
+        mp = g.get("matchupPeriodId")
+        if mp is None or mp >= playoff_start:
+            continue
+        h = (g.get("home") or {}).get("teamId")
+        a = (g.get("away") or {}).get("teamId")
+        if h is None or a is None:
+            continue
+        schedule.setdefault(h, {})[mp] = a
+        schedule.setdefault(a, {})[mp] = h
+    return _assemble_lab(league_id, "espn", name, week, teams, schedule,
+                         week, playoff_start, playoff_teams, fc, [],
+                         nfl_byes(str(season)))

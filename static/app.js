@@ -110,11 +110,16 @@ function cardHTML(lg, key) {
         <div class="winbar-label"><span>${wp}% win</span><span>${100 - wp}%</span></div>
       </div>`;
   }
+  const opt = optimalForTeam(me);
+  const idx = key.replace("lg", "");
+  const optChip = (opt && opt.left > 0.5)
+    ? `<button class="ghost opt-chip" data-idx="${idx}">Bench left +${opt.left} pts</button>` : "";
 
   return `<section class="card ${winning ? "winning" : "losing"}" data-key="${key}">
       <div class="card-head">
         <span class="league-name">${esc(lg.league_name)}</span>
         <span class="head-right">
+          <button class="ghost lab-btn" data-id="${esc(lg.id || "")}" data-name="${esc(lg.league_name)}">📊 Lab</button>
           <button class="ghost trade-btn" data-id="${esc(lg.id || "")}" data-name="${esc(lg.league_name)}">Trade</button>
           <button class="ghost rosters-btn" data-id="${esc(lg.id || "")}" data-name="${esc(lg.league_name)}">All rosters</button>
           <span class="prov ${lg.provider}">${lg.provider}</span>
@@ -126,6 +131,7 @@ function cardHTML(lg, key) {
         ${teamSide(opp, "opp")}
       </div>
       ${winbar}
+      ${optChip ? `<div class="opt-row">${optChip}</div>` : ""}
       <div class="rosters">
         ${col(me)}
         ${col(opp)}
@@ -147,12 +153,253 @@ function renderSummary(leagues) {
     `<b>Winning ${winning}/${real.length}</b> · ${myTotal.toFixed(1)} pts total`;
 }
 
+/* ---------- analytics: optimal lineup, rooting, watch ---------- */
+let lastData = null;
+function round1(x) { return Math.round(x * 10) / 10; }
+
+const SLOT_ELIG = {
+  QB: ["QB"], RB: ["RB"], WR: ["WR"], TE: ["TE"], K: ["K"], DEF: ["DEF", "D/ST"],
+  FLEX: ["RB", "WR", "TE"], SFLEX: ["QB", "RB", "WR", "TE"],
+  WRT: ["WR", "TE"], WRRB: ["WR", "RB"], IDP: ["DL", "LB", "DB"],
+};
+
+function optimalForTeam(t) {
+  if (!t || !t.players) return null;
+  const slots = (t.players || []).map(p => (p.slot || p.pos || "").toUpperCase());
+  const pool = [...(t.players || []), ...(t.bench || [])].filter(p => p.name && p.name !== "(empty)");
+  const order = slots.map((s, i) => ({ s, i }))
+    .sort((a, b) => (SLOT_ELIG[a.s] || [a.s]).length - (SLOT_ELIG[b.s] || [b.s]).length);
+  const used = new Set(), assign = {};
+  for (const { s, i } of order) {
+    const elig = SLOT_ELIG[s] || [s];
+    let best = -1;
+    pool.forEach((p, pi) => {
+      if (used.has(pi) || !elig.includes((p.pos || "").toUpperCase())) return;
+      if (best < 0 || (p.points || 0) > (pool[best].points || 0)) best = pi;
+    });
+    if (best >= 0) { used.add(best); assign[i] = pool[best]; }
+  }
+  const optimalPts = Object.values(assign).reduce((a, p) => a + (p.points || 0), 0);
+  const actualPts = (t.players || []).reduce((a, p) => a + (p.points || 0), 0);
+  const optNames = new Set(Object.values(assign).map(p => p.name));
+  const startNames = new Set((t.players || []).map(p => p.name));
+  const shouldStart = Object.values(assign).filter(p => !startNames.has(p.name));
+  const shouldSit = (t.players || []).filter(p => !optNames.has(p.name) && p.name !== "(empty)");
+  return { optimalPts: round1(optimalPts), actualPts: round1(actualPts),
+    left: round1(optimalPts - actualPts), shouldStart, shouldSit };
+}
+
+function renderWatch(leagues) {
+  const el = document.getElementById("watch");
+  const rows = [];
+  (leagues || []).forEach(lg => {
+    if (lg.error || !lg.my_team || !lg.opp_team) return;
+    const live = [...(lg.my_team.players || []), ...(lg.opp_team.players || [])].some(p => p.game_status === "in");
+    if (!live) return;
+    const diff = Math.abs((lg.my_team.score || 0) - (lg.opp_team.score || 0));
+    const wp = lg.win_prob;
+    if (diff <= 15 || (wp != null && wp >= 30 && wp <= 70)) rows.push({ lg, diff });
+  });
+  if (!rows.length) { el.hidden = true; return; }
+  el.hidden = false;
+  el.innerHTML = `<span class="watch-lbl">👀 Games to watch</span>` + rows.map(({ lg, diff }) => `
+      <span class="watch-chip ${lg.my_team.score >= lg.opp_team.score ? "up" : "down"}">
+        ${esc(lg.league_name)}: <b>${lg.my_team.score.toFixed(1)}</b>–${lg.opp_team.score.toFixed(1)}
+        <small>Δ${diff.toFixed(1)}${lg.win_prob != null ? " · " + lg.win_prob + "%" : ""}</small>
+      </span>`).join("");
+}
+
+function computeRooting(leagues) {
+  const map = new Map();
+  (leagues || []).forEach(lg => {
+    if (lg.error || !lg.my_team || !lg.opp_team) return;
+    const add = (p, dir) => {
+      if (!p.name || p.name === "(empty)") return;
+      const k = p.name;
+      const e = map.get(k) || { name: p.name, pos: p.pos, team: p.team, for: 0, against: 0, live: false, status: p.game_status, forL: [], againstL: [] };
+      if (dir > 0) { e.for++; e.forL.push(lg.league_name); } else { e.against++; e.againstL.push(lg.league_name); }
+      if (p.game_status === "in") e.live = true;
+      if (p.game_status && p.game_status !== "pre") e.status = p.game_status;
+      map.set(k, e);
+    };
+    (lg.my_team.players || []).forEach(p => add(p, 1));
+    (lg.opp_team.players || []).forEach(p => add(p, -1));
+  });
+  const arr = [...map.values()].map(e => ({ ...e, net: e.for - e.against }));
+  return {
+    rootFor: arr.filter(e => e.net > 0).sort((a, b) => b.net - a.net || b.live - a.live),
+    rootAgainst: arr.filter(e => e.net < 0).sort((a, b) => a.net - b.net || b.live - a.live),
+    conflicted: arr.filter(e => e.for > 0 && e.against > 0),
+  };
+}
+
+function rootRow(e) {
+  const dot = e.status === "in" ? "in" : e.status === "post" ? "post" : "pre";
+  const ctx = e.net > 0 ? e.forL.join(", ") : e.againstL.join(", ");
+  return `<div class="root-row">
+      <span class="gdot ${dot}"></span>${posBadge(e.pos)}
+      <span class="root-name">${esc(e.name)} <small>${esc(e.team || "")}</small></span>
+      <span class="root-ctx">${esc(ctx)}</span>
+      <span class="root-net ${e.net > 0 ? "pos" : "neg"}">${e.net > 0 ? "+" : ""}${e.net}</span>
+    </div>`;
+}
+
+function openRooting() {
+  modalCard.classList.remove("full");
+  modalCard.classList.add("wide");
+  modalTitle.textContent = "Rooting guide · across all your leagues";
+  const r = computeRooting((lastData || {}).leagues);
+  const confNote = r.conflicted.length
+    ? `<div class="root-conflict">⚔️ Conflicted (own in one, against in another): ${r.conflicted.map(e => esc(e.name)).join(", ")}</div>` : "";
+  modalBody.innerHTML = `
+    <div class="root-wrap">
+      <div class="root-col"><div class="sec-label" style="background:#16a34a">ROOT FOR</div>
+        ${r.rootFor.length ? r.rootFor.map(rootRow).join("") : `<div class="empty">Nothing yet.</div>`}</div>
+      <div class="root-col"><div class="sec-label" style="background:#dc2626">ROOT AGAINST</div>
+        ${r.rootAgainst.length ? r.rootAgainst.map(rootRow).join("") : `<div class="empty">Nothing yet.</div>`}</div>
+    </div>${confNote}`;
+  modal.hidden = false;
+}
+
+function openOptimal(idx) {
+  const lg = (lastData.leagues || [])[idx];
+  if (!lg || !lg.my_team) return;
+  const o = optimalForTeam(lg.my_team);
+  modalCard.classList.remove("full", "wide");
+  modalTitle.textContent = `${lg.league_name} · optimal lineup`;
+  const swap = o.shouldStart.map((inP, i) => {
+    const outP = o.shouldSit[i];
+    return `<div class="swap"><span class="swap-side">Bench ▸ ${esc(outP ? outP.name : "—")} <small>${outP ? (outP.points || 0).toFixed(1) : ""}</small></span>
+        <span class="swap-arrow">↑</span>
+        <span class="swap-side">Start ▸ ${esc(inP.name)} <small>${(inP.points || 0).toFixed(1)}</small></span></div>`;
+  }).join("");
+  modalBody.innerHTML = `
+    <div class="opt-summary">
+      <div><div class="opt-k">You started</div><div class="opt-v">${o.actualPts}</div></div>
+      <div><div class="opt-k">Optimal</div><div class="opt-v">${o.optimalPts}</div></div>
+      <div><div class="opt-k">Left on bench</div><div class="opt-v ${o.left > 0 ? "bad" : "good"}">${o.left > 0 ? "+" + o.left : "0"}</div></div>
+    </div>
+    ${o.left > 0.1 ? `<div class="avg-title">Should have started</div>${swap}` : `<div class="empty">You played the optimal lineup. 🎯</div>`}`;
+  modal.hidden = false;
+}
+
+/* ---------- League Lab ---------- */
+function moveArrow(m) {
+  if (!m) return `<span class="mv flat">–</span>`;
+  return m > 0 ? `<span class="mv up">▲${m}</span>` : `<span class="mv down">▼${-m}</span>`;
+}
+function labStandings(d) {
+  const rows = d.teams.map((t, i) => {
+    const po = t.playoff_pct;
+    return `<tr class="${t.is_me ? "me" : ""}">
+        <td>${i + 1}</td>
+        <td class="lft">${esc(t.name)}${t.is_me ? " ★" : ""}</td>
+        <td>${t.wins}-${t.losses}${t.ties ? "-" + t.ties : ""}</td>
+        <td>${(t.pf || 0).toFixed(1)}</td>
+        <td>${(t.pa || 0).toFixed(1)}</td>
+        <td class="po"><div class="pobar"><i style="width:${po || 0}%"></i></div>${po == null ? "–" : po + "%"}</td>
+      </tr>`;
+  }).join("");
+  return `<div class="tablewrap"><table class="glog labtbl">
+      <thead><tr><th>#</th><th class="lft">Team</th><th>Rec</th><th>PF</th><th>PA</th><th>Playoff %</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+      <div class="lab-note">Playoff odds simulated ${d.playoff_teams}-team field, reg. season through week ${d.playoff_start - 1}, from current records + team strength (1,500 sims).</div>`;
+}
+function labPower(d) {
+  return d.power.map((t, i) => `<div class="lab-row ${t.is_me ? "me" : ""}">
+      <span class="lab-rank">#${t.rank}</span>${moveArrow(t.movement)}
+      <span class="lab-name">${esc(t.name)}${t.is_me ? " ★" : ""} <small>${esc(t.record || "")}</small></span>
+      <span class="lab-val">${fmtVal(t.value_total)}</span></div>`).join("");
+}
+function labSos(d) {
+  return `<div class="lab-note">Easiest remaining schedule first (avg. opponent roster value).</div>` +
+    d.sos.map((o, i) => `<div class="lab-row ${o.is_me ? "me" : ""}">
+      <span class="lab-rank">${i + 1}</span>
+      <span class="lab-name">${esc(o.name)}${o.is_me ? " ★" : ""} <small>${o.games} games left</small></span>
+      <span class="lab-val">${fmtVal(o.opp_value)}</span></div>`).join("");
+}
+function labWaivers(d) {
+  if (!d.waivers.length) return `<div class="empty">No available players found.</div>`;
+  return `<div class="lab-note">Best available (unrostered), by trade value. 🔥 = trending add on Sleeper.</div>` +
+    d.waivers.map(w => `<div class="lab-row">
+      ${posBadge(w.pos)}<span class="lab-name">${esc(w.name)} <small>${esc(w.team || "FA")}</small> ${w.hot ? "🔥" : ""}</span>
+      <span class="lab-val">${fmtVal(w.value)} ${trendArrow(w.trend)}</span></div>`).join("");
+}
+function labBuySell(d) {
+  const col = (arr, cls) => arr.length ? arr.map(p => `<div class="lab-row">
+      ${posBadge(p.pos)}<span class="lab-name">${esc(p.name)} <small>${esc(p.owner)}</small></span>
+      <span class="lab-val">${fmtVal(p.value)} ${trendArrow(p.trend)}</span></div>`).join("") : `<div class="empty">–</div>`;
+  return `<div class="root-wrap">
+      <div class="root-col"><div class="sec-label" style="background:#dc2626">SELL HIGH · rising 30d</div>${col(d.buysell.sell)}</div>
+      <div class="root-col"><div class="sec-label" style="background:#16a34a">BUY LOW · falling 30d</div>${col(d.buysell.buy)}</div>
+    </div>`;
+}
+function labVegas(d) {
+  const list = arr => arr.length ? arr.map(p => `<div class="lab-row">
+      ${posBadge(p.pos)}<span class="lab-name">${esc(p.name)} <small>${esc(p.owner)}</small></span>
+      <span class="ve-nums">proj ${p.proj} · vegas ${p.vegas_fp} <b class="${p.edge >= 0 ? "pos" : "neg"}">${p.edge >= 0 ? "+" : ""}${p.edge}</b></span></div>`).join("") : `<div class="empty">–</div>`;
+  return `<div class="lab-note">Vegas-implied fantasy points vs. projection (edge). Positive = Vegas likes them more than the projection.</div>
+    <div class="root-wrap">
+      <div class="root-col"><div class="sec-label" style="background:#16a34a">VEGAS OVER PROJECTION</div>${list(d.vegas_edge.over)}</div>
+      <div class="root-col"><div class="sec-label" style="background:#dc2626">VEGAS UNDER PROJECTION</div>${list(d.vegas_edge.under)}</div>
+    </div>`;
+}
+function labRecap(d) {
+  const r = d.recap;
+  if (!r) return `<div class="empty">No games scored yet this week — check back once games kick off.</div>`;
+  const gm = g => g ? `${esc(g.a)} ${g.as} — ${g.bs} ${esc(g.b)} <small>(by ${g.margin})</small>` : "–";
+  return `<div class="recap">
+      <div class="recap-card"><div class="opt-k">Top score</div><div class="recap-v">${esc(r.top.name)} · ${r.top.score}</div></div>
+      <div class="recap-card"><div class="opt-k">Low score</div><div class="recap-v">${esc(r.low.name)} · ${r.low.score}</div></div>
+      <div class="recap-card"><div class="opt-k">Biggest blowout</div><div class="recap-v">${gm(r.blowout)}</div></div>
+      <div class="recap-card"><div class="opt-k">Closest game</div><div class="recap-v">${gm(r.closest)}</div></div>
+    </div>`;
+}
+function labByes(d) {
+  if (!d.byes || !d.byes.length) return `<div class="empty">No upcoming byes on your roster. 🎉</div>`;
+  return `<div class="lab-note">Your players' upcoming NFL bye weeks — weeks with 3+ are flagged.</div>` +
+    d.byes.map(b => `<div class="bye-week ${b.players.length >= 3 ? "warn" : ""}">
+        <div class="bye-h">Week ${b.week} <span>${b.players.length} player${b.players.length > 1 ? "s" : ""}${b.players.length >= 3 ? " ⚠️" : ""}</span></div>
+        <div class="bye-players">${b.players.map(p => `<span class="bye-p">${posBadge(p.pos)}${esc(p.name)}${p.starter ? "" : " <small>(bench)</small>"}</span>`).join("")}</div>
+      </div>`).join("");
+}
+const LAB_TABS = [["standings", "Standings & Odds", labStandings], ["power", "Power Rankings", labPower],
+  ["sos", "Schedule", labSos], ["byes", "Byes", labByes], ["waivers", "Waivers", labWaivers],
+  ["buysell", "Buy / Sell", labBuySell], ["vegas", "Vegas Edge", labVegas], ["recap", "Recap", labRecap]];
+
+async function openLab(id, name) {
+  if (!id) return;
+  modalCard.classList.remove("wide");
+  modalCard.classList.add("full");
+  modalTitle.textContent = `${name || "League"} · Lab`;
+  modalBody.innerHTML = `<div class="loading">Crunching numbers…</div>`;
+  modal.hidden = false;
+  try {
+    const r = await fetch("/api/league?id=" + encodeURIComponent(id), { cache: "no-store" });
+    const d = await r.json();
+    if (d.error) { modalBody.innerHTML = `<div class="err-msg">${esc(d.error)}</div>`; return; }
+    modalBody.innerHTML = `<div class="ptabs">${LAB_TABS.map((t, i) =>
+      `<button class="ptab ${i === 0 ? "active" : ""}" data-tab="${t[0]}">${t[1]}</button>`).join("")}</div>
+      <div id="labHost" class="lab-host"></div>`;
+    const host = modalBody.querySelector("#labHost");
+    const show = key => { const t = LAB_TABS.find(x => x[0] === key); host.innerHTML = t[2](d); };
+    modalBody.querySelectorAll(".ptab").forEach(b => b.addEventListener("click", () => {
+      modalBody.querySelectorAll(".ptab").forEach(x => x.classList.toggle("active", x === b));
+      show(b.dataset.tab);
+    }));
+    show("standings");
+  } catch (e) {
+    modalBody.innerHTML = `<div class="err-msg">Could not load Lab (${esc(e)})</div>`;
+  }
+}
+
 async function load() {
   try {
     const r = await fetch("/api/dashboard", { cache: "no-store" });
     const data = await r.json();
     if (data.error) { showBanner(data.error); return; }
     banner.hidden = true;
+    lastData = data;
 
     weekLabel.textContent = `${data.season} · Week ${data.week}`;
     const anyLive = (data.leagues || []).some(l =>
@@ -163,6 +410,7 @@ async function load() {
     grid.innerHTML = (data.leagues || []).map((lg, i) => cardHTML(lg, "lg" + i)).join("")
       || `<div class="card err">No leagues configured.</div>`;
     renderSummary(data.leagues || []);
+    renderWatch(data.leagues || []);
 
     (data.leagues || []).forEach((lg, i) => {
       const key = "lg" + i;
@@ -287,7 +535,9 @@ async function openTrade(id, name) {
     const teams = data.teams || [];
     let aIdx = teams.findIndex(t => t.is_me); if (aIdx < 0) aIdx = 0;
     let bIdx = teams.findIndex((t, i) => i !== aIdx); if (bIdx < 0) bIdx = 0;
-    T = { teams, aIdx, bIdx, selA: new Set(), selB: new Set(), fairness: 0.12, needOnly: false, startersOnly: false, want: new Set() };
+    const block = new Set(store.get("block:" + id, []));
+    T = { teams, aIdx, bIdx, leagueId: id, selA: new Set(), selB: new Set(),
+      fairness: 0.12, needOnly: false, startersOnly: false, want: new Set(), block };
     renderTrade();
   } catch (e) {
     modalBody.innerHTML = `<div class="err-msg">Could not load trade (${esc(e)})</div>`;
@@ -302,9 +552,11 @@ function tradeSideList(side) {
     const val = p.value != null
       ? `<span class="tl-val">${fmtVal(p.value)}</span><span class="tl-rank">${posRankStr(p)}</span>`
       : `<span class="tl-val dim">—</span>`;
+    const blockStar = t.is_me
+      ? `<span class="tl-block ${T.block.has(String(key)) ? "on" : ""}" data-key="${esc(String(key))}" title="Trade block">★</span>` : "";
     return `<label class="tl-row ${set.has(key) ? "on" : ""}">
         <input type="checkbox" data-side="${side}" data-key="${esc(String(key))}" ${set.has(key) ? "checked" : ""}>
-        ${posBadge(p.slot || p.pos)}<span class="tl-name">${esc(p.name)}</span>${val}${trendArrow(p.trend)}
+        ${posBadge(p.slot || p.pos)}<span class="tl-name">${esc(p.name)}</span>${val}${trendArrow(p.trend)}${blockStar}
       </label>`;
   }).join("");
   return `<div class="trade-list">${rows}</div>`;
@@ -334,6 +586,7 @@ function renderTrade() {
           <label class="need-ctrl"><input type="checkbox" id="needOnly" ${T.needOnly ? "checked" : ""}> Only swaps that fill my needs</label>
           <label class="need-ctrl"><input type="checkbox" id="startersOnly" ${T.startersOnly ? "checked" : ""}> Measure need by starters only</label>
           <button id="findBtn" class="ghost">💡 Suggest swaps</button>
+          <button id="blockBtn" class="ghost">🎯 Trades for my ★ block</button>
         </div>
         <div class="want-row">
           <span class="want-lbl">I want to acquire:</span>
@@ -377,8 +630,66 @@ function renderTrade() {
     if (modalBody.querySelector("#findOut").children.length) renderSwaps();
   }));
   modalBody.querySelector("#findBtn").addEventListener("click", renderSwaps);
+  modalBody.querySelector("#blockBtn").addEventListener("click", renderBlockTrades);
+  modalBody.querySelectorAll(".tl-block").forEach(star => star.addEventListener("click", e => {
+    e.preventDefault(); e.stopPropagation();
+    const k = star.dataset.key;
+    if (T.block.has(k)) T.block.delete(k); else T.block.add(k);
+    star.classList.toggle("on", T.block.has(k));
+    store.set("block:" + T.leagueId, [...T.block]);
+  }));
   renderNeedChips();
   updateTradeFoot();
+}
+
+function renderBlockTrades() {
+  const me = T.teams.find(t => t.is_me) || T.teams[T.aIdx];
+  const meIdx = T.teams.indexOf(me);
+  const blockPlayers = allOf(me).filter(p => T.block.has(String(pkey(p))) && p.value);
+  const host = modalBody.querySelector("#findOut");
+  if (!blockPlayers.length) {
+    host.innerHTML = `<div class="empty">Star (★) players on your team to put them on the block, then tap this again.</div>`;
+    return;
+  }
+  const need = positionNeeds(meIdx);
+  const band = T.fairness || 0.12;
+  const gives = blockPlayers.map(p => [p]);
+  for (let i = 0; i < blockPlayers.length; i++)
+    for (let j = i + 1; j < blockPlayers.length; j++) gives.push([blockPlayers[i], blockPlayers[j]]);
+  const out = [];
+  T.teams.forEach((B, bi) => {
+    if (bi === meIdx) return;
+    const Bp = allOf(B).filter(p => p.value);
+    const consider = (give, get) => {
+      const g = sumVal(give), h = sumVal(get), diff = Math.abs(g - h), den = Math.max(g, h) || 1;
+      if (diff / den > band) return;
+      if (T.want.size) {
+        const gp = new Set(get.map(p => p.pos));
+        let ok = false; T.want.forEach(p => { if (gp.has(p)) ok = true; });
+        if (!ok) return;
+      }
+      const pd = posDeltaByPos(give, get);
+      const fills = NEED_POS.filter(p => need[p] > 0 && (pd[p] || 0) > 0);
+      if (T.needOnly && !fills.length) return;
+      out.push({ team: B.name, give, get, net: h - g, diff, fills });
+    };
+    gives.forEach(give => {
+      Bp.forEach(b => consider(give, [b]));
+      for (let i = 0; i < Bp.length; i++) for (let j = i + 1; j < Bp.length; j++) consider(give, [Bp[i], Bp[j]]);
+    });
+  });
+  out.sort((x, y) => (y.fills.length - x.fills.length) || (x.diff - y.diff));
+  const top = out.slice(0, 14);
+  if (!top.length) { host.innerHTML = `<div class="empty">No fair offers for your block within ±${Math.round(band * 100)}%. Loosen the band or adjust filters.</div>`; return; }
+  host.innerHTML = `<div class="lab-note">Best offers around the league for your ★ block players.</div>` +
+    top.map(s => `<div class="swap block-swap">
+        <span class="swap-team">${esc(s.team)}</span>
+        <span class="swap-side">give ${s.give.map(p => esc(p.name)).join(" + ")} <small>${fmtVal(sumVal(s.give))}</small></span>
+        <span class="swap-arrow">⇄</span>
+        <span class="swap-side">get ${s.get.map(p => esc(p.name)).join(" + ")} <small>${fmtVal(sumVal(s.get))}</small></span>
+        <span class="swap-tags">${s.fills.map(p => `<span class="fill-tag ${posClass(p)}">fills ${p}</span>`).join("")}</span>
+        <span class="swap-delta ${Math.abs(s.net) <= Math.max(sumVal(s.give), sumVal(s.get)) * 0.05 ? "fair" : ""}">${s.net >= 0 ? "+" : "−"}${fmtVal(Math.abs(s.net))}</span>
+      </div>`).join("");
 }
 
 const NEED_POS = ["QB", "RB", "WR", "TE"];
@@ -750,11 +1061,16 @@ async function openPlayer(d) {
 }
 
 grid.addEventListener("click", e => {
+  const lb = e.target.closest(".lab-btn");
+  if (lb) { openLab(lb.dataset.id, lb.dataset.name); return; }
+  const oc = e.target.closest(".opt-chip");
+  if (oc) { openOptimal(parseInt(oc.dataset.idx, 10)); return; }
   const tb = e.target.closest(".trade-btn");
   if (tb) { openTrade(tb.dataset.id, tb.dataset.name); return; }
   const btn = e.target.closest(".rosters-btn");
   if (btn) { openRosters(btn.dataset.id, btn.dataset.name); return; }
 });
+document.getElementById("rootingBtn").addEventListener("click", openRooting);
 document.body.addEventListener("click", e => {
   const row = e.target.closest(".prow.clickable, .rcell.clickable");
   if (row) openPlayer(row.dataset);
