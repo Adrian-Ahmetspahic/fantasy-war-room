@@ -30,6 +30,10 @@ def load_config():
         return json.load(f)
 
 
+def _override_for(cfg, league_id):
+    return ((cfg or {}).get("league_overrides") or {}).get(str(league_id))
+
+
 def build_dashboard():
     cfg = load_config()
     if cfg is None:
@@ -66,7 +70,7 @@ def build_dashboard():
             tasks.append((
                 f"sleeper:{lid}",
                 lambda lid=lid: fantasy.sleeper_league_payload(
-                    lid, sleeper_user_id, week, players, nfl)
+                    lid, sleeper_user_id, week, players, nfl, _override_for(cfg, lid))
             ))
 
     # ---- ESPN ----
@@ -79,7 +83,7 @@ def build_dashboard():
         tasks.append((
             f"espn:{lid}",
             lambda lid=lid, s2=s2, swid=swid: fantasy.espn_league_payload(
-                lid, s2, swid, season, week, nfl)
+                lid, s2, swid, season, week, nfl, _override_for(cfg, lid))
         ))
 
     leagues = []
@@ -128,14 +132,14 @@ def build_rosters(full_id):
                 my_uid = fantasy.sleeper_user_id(sl["username"])
             except Exception as e:
                 print(f"[rosters] sleeper user lookup failed: {e}")
-        return fantasy.sleeper_all_rosters(league_id, week, players, nfl, my_uid)
+        return fantasy.sleeper_all_rosters(league_id, week, players, nfl, my_uid, _override_for(cfg, league_id))
 
     if provider == "espn":
         for lg in cfg.get("espn") or []:
             if str(lg.get("league_id")) == str(league_id):
                 s2 = lg.get("espn_s2")
                 swid = lg.get("swid") or lg.get("SWID")
-                return fantasy.espn_all_rosters(league_id, s2, swid, season, week, nfl)
+                return fantasy.espn_all_rosters(league_id, s2, swid, season, week, nfl, _override_for(cfg, league_id))
         return {"error": "league not found in config"}
 
     return {"error": "unknown provider"}
@@ -218,14 +222,14 @@ def build_league_lab(full_id):
                 my_uid = fantasy.sleeper_user_id(sl["username"])
             except Exception:
                 pass
-        return fantasy.league_lab_sleeper(league_id, my_uid, week, players, nfl)
+        return fantasy.league_lab_sleeper(league_id, my_uid, week, players, nfl, _override_for(cfg, league_id))
 
     if provider == "espn":
         for lg in cfg.get("espn") or []:
             if str(lg.get("league_id")) == str(league_id):
                 return fantasy.league_lab_espn(
                     league_id, lg.get("espn_s2"), lg.get("swid") or lg.get("SWID"),
-                    season, week, nfl)
+                    season, week, nfl, _override_for(cfg, league_id))
         return {"error": "league not found in config"}
     return {"error": "unknown provider"}
 

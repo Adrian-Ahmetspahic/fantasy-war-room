@@ -92,8 +92,11 @@ games; press `Ctrl+C` to stop. Use a different port with `PORT=9000 python3 serv
   gracefully, but a source may occasionally be unavailable.
 - **Projections & win %** are estimates. Player projections come from Sleeper/ESPN;
   the win-probability model is a per-player-variance estimate, not a calibrated forecast.
-- **Trade values** are FantasyCalc's redraft / PPR / 1QB consensus, sized to your
-  league — a strong neutral baseline, not your league's exact scoring.
+- **Trade values** come from FantasyCalc, **auto-matched to each league's format** —
+  team size, PPR, superflex, and (Sleeper) dynasty are detected from league settings.
+  ESPN dynasty can't be auto-detected, so set it (or override any of the above) per
+  league via `league_overrides` in `config.json` (see `config.example.json`). Values
+  are a neutral market baseline, not your league's exact scoring.
 - **Vegas odds** are DraftKings-only (one book) and post during game week; some
   players won't have props early in the week or in the offseason.
 - Player metadata from Sleeper is cached in `.cache/` and refreshed daily.

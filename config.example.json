@@ -22,5 +22,10 @@
       "espn_s2": "PASTE_YOUR_ESPN_S2_COOKIE_HERE",
       "swid": "{PASTE-YOUR-SWID-COOKIE-HERE}"
     }
-  ]
+  ],
+
+  "_note_overrides": "OPTIONAL. Trade values (FantasyCalc) auto-detect PPR, superflex, and dynasty from each league's settings. Only add an entry here to override that detection for a specific league_id. Keys: dynasty (true/false), superflex (true/false), ppr (1 = full, 0.5 = half, 0 = standard). ESPN dynasty can't be auto-detected, so set it here if your ESPN league is a dynasty/keeper.",
+  "league_overrides": {
+    "111111": { "dynasty": true, "superflex": true, "ppr": 0.5 }
+  }
 }

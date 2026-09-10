@@ -357,7 +357,7 @@ def _sl_common(league_id, week):
     return league, rosters, roster_by_id, user_name, matchups, projections, slots
 
 
-def sleeper_league_payload(league_id, my_user_id, week, players, nfl):
+def sleeper_league_payload(league_id, my_user_id, week, players, nfl, override=None):
     league, rosters, roster_by_id, user_name, matchups, projections, slots = _sl_common(
         league_id, week)
 
@@ -376,7 +376,7 @@ def sleeper_league_payload(league_id, my_user_id, week, players, nfl):
     }
 
     # build every team, enrich, and pair into matchups
-    fc = fantasycalc_values(num_teams=len(rosters))
+    fc = _fc_for(len(rosters), _sleeper_val_params(league, override))
     by_mid, meta_by_roster = {}, {}
     for m in matchups:
         r = roster_by_id.get(m["roster_id"])
@@ -419,12 +419,12 @@ def _pair_matchups(by_mid):
     return out
 
 
-def sleeper_all_rosters(league_id, week, players, nfl, my_user_id=None):
+def sleeper_all_rosters(league_id, week, players, nfl, my_user_id=None, override=None):
     """Every team's full roster in a league, for the "all rosters" view."""
     league, rosters, roster_by_id, user_name, matchups, projections, slots = _sl_common(
         league_id, week)
     by_roster = {m["roster_id"]: m for m in matchups}
-    fc = fantasycalc_values(num_teams=len(rosters))
+    fc = _fc_for(len(rosters), _sleeper_val_params(league, override))
     teams = []
     for r in rosters:
         m = by_roster.get(r["roster_id"])
@@ -584,7 +584,7 @@ def _espn_build_team(t, week, nfl):
     }
 
 
-def espn_league_payload(league_id, espn_s2, swid, season, week, nfl):
+def espn_league_payload(league_id, espn_s2, swid, season, week, nfl, override=None):
     league = _espn_fetch(league_id, espn_s2, swid, season, week)
     league_name = (league.get("settings") or {}).get("name", "ESPN league")
     teams = {t["id"]: t for t in league.get("teams", [])}
@@ -597,7 +597,7 @@ def espn_league_payload(league_id, espn_s2, swid, season, week, nfl):
     }
 
     my_team_id = _espn_my_team_id(league, swid)
-    fc = fantasycalc_values(num_teams=len(teams))
+    fc = _fc_for(len(teams), _espn_val_params(league, override))
     built = {}
 
     def team_meta(tid):
@@ -632,12 +632,12 @@ def espn_league_payload(league_id, espn_s2, swid, season, week, nfl):
     return base
 
 
-def espn_all_rosters(league_id, espn_s2, swid, season, week, nfl):
+def espn_all_rosters(league_id, espn_s2, swid, season, week, nfl, override=None):
     league = _espn_fetch(league_id, espn_s2, swid, season, week)
     league_name = (league.get("settings") or {}).get("name", "ESPN league")
     raw_teams = league.get("teams", [])
     my_id = _espn_my_team_id(league, swid)
-    fc = fantasycalc_values(num_teams=len(raw_teams))
+    fc = _fc_for(len(raw_teams), _espn_val_params(league, override))
     teams = []
     for raw in raw_teams:
         t = _espn_build_team(raw, week, nfl)
@@ -801,6 +801,50 @@ def fantasycalc_values(num_teams=12, num_qbs=1, ppr=1, dynasty=False):
         print(f"[fantasycalc] fetch failed: {e}")
     _FC_CACHE[key] = (time.time(), idx)
     return idx
+
+
+def _apply_override(dynasty, num_qbs, ppr, override):
+    """Let config.json override the auto-detected value settings for a league."""
+    o = override or {}
+    if "dynasty" in o:
+        dynasty = bool(o["dynasty"])
+    if "num_qbs" in o:
+        num_qbs = int(o["num_qbs"])
+    elif "superflex" in o:
+        num_qbs = 2 if o["superflex"] else 1
+    if "ppr" in o:
+        ppr = o["ppr"]
+    return {"num_teams": None, "dynasty": dynasty, "num_qbs": num_qbs, "ppr": ppr}
+
+
+def _sleeper_val_params(league, override=None):
+    settings = league.get("settings") or {}
+    rec = (league.get("scoring_settings") or {}).get("rec", 0)
+    ppr = 1 if rec >= 1 else (0.5 if rec >= 0.4 else 0)
+    rp = league.get("roster_positions") or []
+    num_qbs = 2 if ("SUPER_FLEX" in rp or rp.count("QB") >= 2) else 1
+    dynasty = settings.get("type") == 2          # Sleeper: 0 redraft, 1 keeper, 2 dynasty
+    return _apply_override(dynasty, num_qbs, ppr, override)
+
+
+def _espn_val_params(league, override=None):
+    s = league.get("settings") or {}
+    rec_pts = 0
+    for it in ((s.get("scoringSettings") or {}).get("scoringItems") or []):
+        if it.get("statId") == 53:               # 53 = receptions
+            rec_pts = it.get("points", 0) or 0
+            break
+    ppr = 1 if rec_pts >= 1 else (0.5 if rec_pts >= 0.4 else 0)
+    counts = (s.get("rosterSettings") or {}).get("lineupSlotCounts") or {}
+    qb = counts.get("0", 0) or 0                  # slot 0 = QB
+    op = counts.get("7", 0) or 0                  # slot 7 = OP / superflex
+    num_qbs = 2 if (qb >= 2 or op >= 1) else 1
+    return _apply_override(False, num_qbs, ppr, override)  # ESPN has no clean dynasty flag
+
+
+def _fc_for(num_teams, params):
+    return fantasycalc_values(num_teams=num_teams, num_qbs=params["num_qbs"],
+                              ppr=params["ppr"], dynasty=params["dynasty"])
 
 
 def _fc_lookup(fc, sleeper_id, espn_id):
@@ -1665,13 +1709,13 @@ def _assemble_lab(league_id, provider, name, week, teams, schedule,
     }
 
 
-def league_lab_sleeper(league_id, my_user_id, week, players, nfl):
+def league_lab_sleeper(league_id, my_user_id, week, players, nfl, override=None):
     league, rosters, roster_by_id, user_name, matchups, projections, slots = _sl_common(
         league_id, week)
     settings = league.get("settings", {})
     playoff_start = settings.get("playoff_week_start") or 15
     playoff_teams = settings.get("playoff_teams") or 6
-    fc = fantasycalc_values(num_teams=len(rosters))
+    fc = _fc_for(len(rosters), _sleeper_val_params(league, override))
     dk = dk_props()
     by_roster = {m["roster_id"]: m for m in matchups}
     teams = []
@@ -1698,7 +1742,7 @@ def league_lab_sleeper(league_id, my_user_id, week, players, nfl):
                          fc, sleeper_trending(), byes)
 
 
-def league_lab_espn(league_id, espn_s2, swid, season, week, nfl):
+def league_lab_espn(league_id, espn_s2, swid, season, week, nfl, override=None):
     league = _espn_fetch(league_id, espn_s2, swid, season, week)
     name = (league.get("settings") or {}).get("name", "ESPN league")
     ss = ((league.get("settings") or {}).get("scheduleSettings") or {})
@@ -1707,7 +1751,7 @@ def league_lab_espn(league_id, espn_s2, swid, season, week, nfl):
     playoff_start = reg + 1
     raw_teams = league.get("teams", [])
     my_id = _espn_my_team_id(league, swid)
-    fc = fantasycalc_values(num_teams=len(raw_teams))
+    fc = _fc_for(len(raw_teams), _espn_val_params(league, override))
     dk = dk_props()
     teams = []
     for raw in raw_teams:
