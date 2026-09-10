@@ -8,7 +8,7 @@ a trade machine, and sportsbook odds. Runs entirely on your own machine with
 Everything is **read-only** — the app never logs into or changes anything in your
 leagues. It only reads public/undocumented endpoints to display data.
 
-![leagues](https://img.shields.io/badge/leagues-Sleeper%20%2B%20ESPN-8b5cf6) ![deps](https://img.shields.io/badge/dependencies-none-16a34a)
+![leagues](https://img.shields.io/badge/leagues-Sleeper%20%2B%20ESPN-8b5cf6) ![deps](https://img.shields.io/badge/dependencies-none-16a34a) ![license](https://img.shields.io/badge/license-MIT-blue)
 
 ---
 
@@ -85,4 +85,34 @@ games; press `Ctrl+C` to stop. Use a different port with `PORT=9000 python3 serv
   players won't have props early in the week or in the offseason.
 - Player metadata from Sleeper is cached in `.cache/` and refreshed daily.
 
-*Personal project for personal use. Not affiliated with Sleeper, ESPN, DraftKings, or FantasyCalc.*
+---
+
+## Disclaimer
+
+This is an **unofficial, personal, non-commercial** project provided for
+**informational and educational purposes only**, and it is **not affiliated with,
+endorsed by, or sponsored by** Sleeper, ESPN, DraftKings, FantasyCalc, the NFL, or
+any of their affiliates. All product names, logos, team marks, and trademarks are
+the property of their respective owners and are used here only to identify the data
+being displayed; no ownership or endorsement is implied.
+
+- **Unofficial data sources.** The app reads from public and undocumented endpoints
+  (Sleeper, ESPN, DraftKings, FantasyCalc). These are not official, supported, or
+  guaranteed interfaces; they can change, rate-limit, or stop working at any time,
+  and using them may be subject to each provider's Terms of Service. **You are
+  responsible for reviewing and complying with those terms** and for how you use
+  this software.
+- **No betting advice.** Sportsbook odds are shown for informational purposes only
+  and are **not** betting or financial advice. They come from a single book, may be
+  delayed or inaccurate, and should not be relied on for wagering. Gambling laws vary
+  by jurisdiction — know and follow yours.
+- **No warranty.** Projections, win probabilities, trade values, and playoff odds are
+  estimates and may be wrong. The software is provided "as is", without warranty of
+  any kind, as stated in the [LICENSE](LICENSE). Use at your own risk.
+- **Your data stays with you.** You supply your own credentials in a local
+  `config.json` that is git-ignored and never committed or transmitted anywhere by
+  this project. Keep it private.
+
+## License
+
+Released under the [MIT License](LICENSE) — © 2026 Adrian Ahmetspahic.
