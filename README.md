@@ -16,23 +16,36 @@ leagues. It only reads public/undocumented endpoints to display data.
 
 **Live dashboard**
 - All your matchups on one screen, auto-detected from your Sleeper username and ESPN leagues.
-- Your score vs. opponent, projected finals, and a **win-probability** model that sharpens as games finish.
-- Player rows with live points, projections, position colors (Sleeper-style), game status dots (⚪ yet to play · 🔴 live · 🟢 final), red-zone highlight, and a score-flash when someone scores.
-- Toggle to show **benches**; a header summary of how many matchups you're winning.
+- Live scoring, projected finals, and a **win-probability** model built from per-player variance that sharpens as games finish.
+- **Live projections** that update with the game clock (points banked + remaining projection).
+- Rich player rows: position colors, game-status dots (⚪ yet to play · 🔴 live · 🟢 final), **red-zone** highlight, score-flash on scoring, **NFL team logos**, **opponent** (vs / @), **injury status** badges (Q / D / O / IR / SUS / PUP / DTD…), and trade value + positional rank + 30-day trend.
+- **Browse every matchup** in a league (pager), or **expand** one into a full-screen focus view.
+- Benches toggle, light/dark theme toggle, auto-refresh (with interval), and a header summary of how many matchups you're winning.
+
+**Cross-league tools** (leveraging all your leagues at once)
+- **Rooting guide** — nets every NFL player into who to root for / against across your leagues, and flags conflicts (own in one league, facing in another).
+- **Games to watch** — live strip of close matchups.
+- **Optimal lineup / points left on bench** — per league, the best lineup you could've started vs. what you did.
 
 **All-rosters league view**
-- A full-screen, Sleeper-style grid of every team in a league — one column per team, position-colored cells, records, and **team strength** ranking (summed trade value).
+- A full-screen, Sleeper-style grid of every team — position-colored cells, records, values, and **team-strength** ranking.
 
 **Player profiles** (click any player)
-- **Game Log** with a season dropdown back to a player's rookie year, per-game **fantasy points**, color-graded stats (heatmap), grouped stat categories, and a **season-averages** table.
-- **News & Outlook** from ESPN and Sleeper, clearly separated by source, plus the Sleeper season outlook.
-- **Depth Chart** for the player's NFL team (QB/RB/WR/TE/K), with the player highlighted.
-- **Vegas** tab — DraftKings player props: anytime-TD odds and implied over/under lines for passing / rushing / receiving yards, with the full milestone ladder.
+- **Game Log** with a season dropdown, per-game **fantasy points**, color-graded stats (heatmap), grouped categories, and a **season-averages** table. Uses ESPN, with an automatic **Sleeper stats fallback** when ESPN's log is empty.
+- **News & Outlook** from ESPN and Sleeper, separated by source.
+- **Depth Chart** for the player's NFL team, with the player highlighted.
+- **Vegas** tab — DraftKings props: anytime-TD odds and implied over/under lines for passing / rushing / receiving yards.
+
+**League Lab** (per league)
+- **Standings & playoff odds** — Monte-Carlo simulation from records, remaining schedule, and team strength.
+- **Power rankings** with week-over-week movement.
+- **Strength of schedule**, **bye-week planner**, **waivers** (best available + Sleeper trending), **buy-low / sell-high**, **Vegas edge** (implied vs. projection), and a **weekly recap**.
 
 **Trade tools**
-- **Trade machine** — pick any two teams, select players from each side, and get a live fair/uneven verdict weighted by trade value.
-- **Trade finder** — suggests balanced 1-for-1 and 2-for-1 swaps, with a **fairness slider**, a **"fill my needs"** filter (auto-detected weak positions, optionally starters-only), and **target-position** toggles ("I want WRs").
-- Trade values, positional ranks, and **30-day trend arrows** are shown on roster cells and profiles (via [FantasyCalc](https://fantasycalc.com)).
+- **Trade machine** — pick any two teams, select players, get a live fair/uneven verdict by trade value.
+- **Trade finder** — balanced swap suggestions with a **fairness slider**, **fill-my-needs** filter (optionally starters-only), and **target-position** toggles.
+- **Trade block** — star your players and scan the whole league for fair offers.
+- Trade values, ranks, and 30-day trends via [FantasyCalc](https://fantasycalc.com).
 
 ---
 
