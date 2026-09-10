@@ -184,10 +184,17 @@ def build_player(params):
 
 def build_gamelog(params):
     espn_id = (params.get("espn_id") or [""])[0] or None
+    sleeper_id = (params.get("sleeper_id") or [""])[0] or None
     season = (params.get("season") or [""])[0] or None
-    if not espn_id:
-        return {"error": "no espn_id"}
-    return fantasy.espn_gamelog(espn_id, season)
+    if not (espn_id or sleeper_id):
+        return {"error": "no player id"}
+    players = fantasy.sleeper_players()
+    if sleeper_id and not espn_id:
+        espn_id = (players.get(str(sleeper_id)) or {}).get("espn_id")
+        espn_id = str(espn_id) if espn_id else None
+    if espn_id and not sleeper_id:
+        sleeper_id = _espn_sleeper_index(players).get(str(espn_id))
+    return fantasy.player_gamelog(espn_id, sleeper_id, season)
 
 
 def build_league_lab(full_id):

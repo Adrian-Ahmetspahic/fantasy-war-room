@@ -139,6 +139,18 @@ button:hover { border-color: var(--me); }
 .pname { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
 .psub { color: var(--muted); font-size: 10.5px; }
 .psub .rztag { color: var(--rz); font-weight: 700; }
+.tlogo { width: 14px; height: 14px; object-fit: contain; vertical-align: -3px; margin-right: 3px; display: inline-block; }
+.opp-vs { color: var(--muted); }
+.opp-vs .tlogo { width: 12px; height: 12px; margin-right: 2px; }
+.inj { font-size: 9px; font-weight: 800; padding: 0 3px; border-radius: 3px; margin-left: 4px;
+  vertical-align: 1px; letter-spacing: .2px; }
+.inj-out { background: #dc2626; color: #fff; }
+.inj-doubt { background: #f97316; color: #fff; }
+.inj-q { background: #eab308; color: #1a1205; }
+.rcell-name .inj { box-shadow: 0 0 0 1px rgba(255,255,255,.55); }
+.pp-name .inj { font-size: 11px; padding: 1px 5px; vertical-align: 3px; }
+.rcell-top .tlogo { width: 13px; height: 13px; vertical-align: -2px; filter: drop-shadow(0 0 1px rgba(0,0,0,.35)); }
+.pp-sub .tlogo { width: 18px; height: 18px; vertical-align: -4px; }
 .ppts { font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
 .ppts small { color: var(--muted); font-weight: 500; display: block; font-size: 10px; }
 
@@ -505,6 +517,22 @@ table.labtbl td.po { min-width: 120px; }
 .recap-v { font-size: 15px; font-weight: 700; margin-top: 4px; }
 .recap-v small { color: var(--muted); font-weight: 500; }
 @media (max-width: 640px) { .recap { grid-template-columns: 1fr; } }
+
+/* matchup pager + expand + focus */
+.side.right { text-align: right; }
+.side.left .team-name { color: var(--muted); }
+.pager { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 8px 16px 2px; }
+.pg-lbl { font-size: 12px; color: var(--muted); font-weight: 700; white-space: nowrap; }
+.mine-tag { color: var(--me); font-weight: 800; margin-left: 4px; }
+.pgbtn { border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 8px;
+  min-width: 28px; height: 24px; cursor: pointer; font-size: 14px; line-height: 1; }
+.pgbtn:hover { border-color: var(--me); color: var(--me); }
+.expand-btn { font-size: 13px; padding: 3px 8px; }
+.card.other { border-top-color: var(--line) !important; }
+.pager.big { padding: 2px 0 12px; }
+.pager.big .pgbtn { min-width: auto; padding: 4px 14px; font-weight: 700; }
+.focus .scoreline { padding: 14px 8px 8px; }
+.focus-rosters .bench { display: block; }
 
 .card.err { padding: 0 0 12px; color: var(--lose); }
 .foot { text-align: center; color: var(--muted); font-size: 11px; padding: 16px; }

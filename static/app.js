@@ -56,8 +56,14 @@ function teamSide(t, cls) {
     </div>`;
 }
 
+function oppStr(p) {
+  if (!p.opp) return "";
+  return ` <span class="opp-vs">${esc(p.opp_ha || "vs")} ${teamLogo(p.opp)}${esc(p.opp)}</span>`;
+}
 function playerRow(p) {
-  const proj = p.projected != null ? `<small>${p.projected.toFixed(1)} proj</small>` : "";
+  const projVal = p.proj_live != null ? p.proj_live : p.projected;
+  const proj = (projVal != null && p.game_status !== "post")
+    ? `<small>${projVal.toFixed(1)} proj</small>` : "";
   const rz = p.redzone ? ` · <span class="rztag">RED ZONE</span>` : "";
   const detail = p.game_detail ? ` · ${esc(p.game_detail)}` : "";
   const clickable = p.espn_id || p.sleeper_id;
@@ -69,8 +75,8 @@ function playerRow(p) {
       <span class="gdot ${p.game_status}" title="${statusWord(p.game_status)}"></span>
       ${posBadge(p.slot || p.pos)}
       <span class="pmeta">
-        <div class="pname">${esc(p.name)}</div>
-        <div class="psub">${esc(p.team || "FA")}${rz}${detail}${p.value != null ? ` · <span class="vtag">${posRankStr(p)} ${fmtVal(p.value)}</span>` : ""}</div>
+        <div class="pname">${esc(p.name)}${injBadge(p)}</div>
+        <div class="psub">${teamLogo(p.team)}${esc(p.team || "FA")}${oppStr(p)}${rz}${detail}${p.value != null ? ` · <span class="vtag">${posRankStr(p)} ${fmtVal(p.value)}</span>` : ""}</div>
       </span>
       <span class="ppts">${(p.points || 0).toFixed(1)}${proj}</span>
     </div>`;
@@ -90,6 +96,34 @@ function col(t) {
   return `<div class="col">${(t.players || []).map(playerRow).join("")}${benchBlock(t.bench)}</div>`;
 }
 
+const cardIdx = {};   // league key -> current matchup index
+
+function leagueMatchups(lg) {
+  if (lg.matchups && lg.matchups.length) return lg.matchups;
+  if (lg.my_team && lg.opp_team)
+    return [{ a: lg.my_team, b: lg.opp_team, a_is_me: true, b_is_me: false, win_prob: lg.win_prob }];
+  return [];
+}
+function matchupPager(key, total, cur, mineIdx, cls) {
+  if (total <= 1) return "";
+  const tag = cur === mineIdx ? `<span class="mine-tag">your matchup</span>` : "";
+  return `<div class="pager ${cls || ""}">
+      <button class="pgbtn ${cls ? "f" : ""}" data-key="${key}" data-dir="-1">‹</button>
+      <span class="pg-lbl">Matchup ${cur + 1} / ${total} ${tag}</span>
+      <button class="pgbtn ${cls ? "f" : ""}" data-key="${key}" data-dir="1">›</button>
+    </div>`;
+}
+function scoreBlock(mu) {
+  const wp = mu.win_prob;
+  const aCls = mu.a_is_me ? "me" : "left";
+  const bCls = (mu.b_is_me ? "me " : "") + "right";
+  const winbar = wp != null ? `<div class="winbar-wrap">
+      <div class="winbar"><i style="width:${wp}%"></i></div>
+      <div class="winbar-label"><span>${wp}%</span><span>${100 - wp}%</span></div>
+    </div>` : "";
+  return `<div class="scoreline">${teamSide(mu.a, aCls)}<div class="vs">vs</div>${teamSide(mu.b, bCls)}</div>${winbar}`;
+}
+
 function cardHTML(lg, key) {
   if (lg.error) {
     return `<section class="card err">
@@ -99,42 +133,35 @@ function cardHTML(lg, key) {
         ${lg.id ? `<button class="ghost rosters-btn" data-id="${esc(lg.id)}" data-name="${esc(lg.league_name)}">View all rosters</button>` : ""}
       </section>`;
   }
-  const me = lg.my_team, opp = lg.opp_team;
-  const wp = lg.win_prob;
-  const winning = me && opp && me.score >= opp.score;
-
-  let winbar = "";
-  if (wp != null) {
-    winbar = `<div class="winbar-wrap">
-        <div class="winbar"><i style="width:${wp}%"></i></div>
-        <div class="winbar-label"><span>${wp}% win</span><span>${100 - wp}%</span></div>
-      </div>`;
-  }
-  const opt = optimalForTeam(me);
+  const ms = leagueMatchups(lg);
+  const mineIdx = ms.findIndex(m => m.a_is_me || m.b_is_me);
+  if (!(key in cardIdx)) cardIdx[key] = mineIdx >= 0 ? mineIdx : 0;
+  const cur = Math.max(0, Math.min(cardIdx[key], ms.length - 1));
+  const mu = ms[cur] || { a: {}, b: {} };
+  const isMine = !!(mu.a_is_me || mu.b_is_me);
+  const winning = (mu.a.score || 0) >= (mu.b.score || 0);
   const idx = key.replace("lg", "");
-  const optChip = (opt && opt.left > 0.5)
+  const opt = optimalForTeam(lg.my_team);
+  const optChip = (isMine && opt && opt.left > 0.5)
     ? `<button class="ghost opt-chip" data-idx="${idx}">Bench left +${opt.left} pts</button>` : "";
 
-  return `<section class="card ${winning ? "winning" : "losing"}" data-key="${key}">
+  return `<section class="card ${winning ? "winning" : "losing"} ${isMine ? "" : "other"}" data-key="${key}">
       <div class="card-head">
         <span class="league-name">${esc(lg.league_name)}</span>
         <span class="head-right">
+          <button class="ghost expand-btn" data-idx="${idx}" title="Expand">⤢</button>
           <button class="ghost lab-btn" data-id="${esc(lg.id || "")}" data-name="${esc(lg.league_name)}">📊 Lab</button>
           <button class="ghost trade-btn" data-id="${esc(lg.id || "")}" data-name="${esc(lg.league_name)}">Trade</button>
           <button class="ghost rosters-btn" data-id="${esc(lg.id || "")}" data-name="${esc(lg.league_name)}">All rosters</button>
           <span class="prov ${lg.provider}">${lg.provider}</span>
         </span>
       </div>
-      <div class="scoreline">
-        ${teamSide(me, "me")}
-        <div class="vs">vs</div>
-        ${teamSide(opp, "opp")}
-      </div>
-      ${winbar}
+      ${matchupPager(key, ms.length, cur, mineIdx)}
+      ${scoreBlock(mu)}
       ${optChip ? `<div class="opt-row">${optChip}</div>` : ""}
       <div class="rosters">
-        ${col(me)}
-        ${col(opp)}
+        ${col(mu.a)}
+        ${col(mu.b)}
       </div>
     </section>`;
 }
@@ -142,6 +169,20 @@ function cardHTML(lg, key) {
 function esc(s) {
   return String(s ?? "").replace(/[&<>"]/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function injBadge(p) {
+  if (!p.injury) return "";
+  const out = ["O", "IR", "SUS", "PUP", "COV", "NA", "DNR"].includes(p.injury);
+  const sev = out ? "out" : (p.injury === "D" ? "doubt" : "q");
+  return `<span class="inj inj-${sev}" title="${esc(p.injury)}">${esc(p.injury)}</span>`;
+}
+
+const TEAM_LOGO_FIX = { WAS: "wsh" };   // ESPN logo filenames differ for a few
+function teamLogo(team) {
+  if (!team) return "";
+  const code = (TEAM_LOGO_FIX[team] || team).toLowerCase();
+  return `<img class="tlogo" src="https://a.espncdn.com/i/teamlogos/nfl/500/${code}.png" alt="" loading="lazy" onerror="this.style.visibility='hidden'">`;
 }
 
 function renderSummary(leagues) {
@@ -283,6 +324,43 @@ function openOptimal(idx) {
   modal.hidden = false;
 }
 
+function renderCards() {
+  const leagues = (lastData && lastData.leagues) || [];
+  grid.innerHTML = leagues.map((lg, i) => cardHTML(lg, "lg" + i)).join("")
+    || `<div class="card err">No leagues configured.</div>`;
+  renderSummary(leagues);
+  renderWatch(leagues);
+}
+
+/* ---------- focus / expand a single league ---------- */
+let focusState = null;
+function renderFocus() {
+  const lg = lastData.leagues[focusState.leagueIdx];
+  const ms = leagueMatchups(lg);
+  const mineIdx = ms.findIndex(m => m.a_is_me || m.b_is_me);
+  const cur = Math.max(0, Math.min(focusState.idx, ms.length - 1));
+  const mu = ms[cur] || { a: {}, b: {} };
+  modalBody.innerHTML = `<div class="focus">
+      ${matchupPager("focus", ms.length, cur, mineIdx, "big")}
+      ${scoreBlock(mu)}
+      <div class="rosters focus-rosters">${col(mu.a)}${col(mu.b)}</div>
+    </div>`;
+  modalBody.querySelectorAll(".pgbtn.f").forEach(b => b.addEventListener("click", () => {
+    focusState.idx = (cur + parseInt(b.dataset.dir, 10) + ms.length) % ms.length;
+    renderFocus();
+  }));
+}
+function openFocus(leagueIdx) {
+  const lg = lastData.leagues[leagueIdx];
+  if (!lg || lg.error) return;
+  modalCard.classList.remove("wide");
+  modalCard.classList.add("full");
+  modalTitle.textContent = lg.league_name;
+  focusState = { leagueIdx, idx: cardIdx["lg" + leagueIdx] || 0 };
+  renderFocus();
+  modal.hidden = false;
+}
+
 /* ---------- League Lab ---------- */
 function moveArrow(m) {
   if (!m) return `<span class="mv flat">–</span>`;
@@ -407,18 +485,17 @@ async function load() {
         .some(p => p.game_status === "in"));
     pulse.style.visibility = anyLive ? "visible" : "hidden";
 
-    grid.innerHTML = (data.leagues || []).map((lg, i) => cardHTML(lg, "lg" + i)).join("")
-      || `<div class="card err">No leagues configured.</div>`;
-    renderSummary(data.leagues || []);
-    renderWatch(data.leagues || []);
+    renderCards();
 
     (data.leagues || []).forEach((lg, i) => {
       const key = "lg" + i;
       const card = grid.querySelector(`[data-key="${key}"]`);
       if (!card || lg.error) return;
+      const ms = leagueMatchups(lg);
+      const mineIdx = ms.findIndex(m => m.a_is_me || m.b_is_me);
       const scores = card.querySelectorAll("[data-score]");
       const prev = prevScores[key];
-      if (prev) {
+      if (prev && cardIdx[key] === mineIdx) {   // only flash while viewing your matchup
         if (lg.my_team && lg.my_team.score > prev.me) scores[0]?.classList.add("bump");
         if (lg.opp_team && lg.opp_team.score > prev.opp) scores[1]?.classList.add("bump");
       }
@@ -467,10 +544,12 @@ function rosterCell(pl) {
     + `data-team="${esc(pl.team || "")}" data-pos="${esc(pl.pos || "")}" data-name="${esc(pl.name || "")}"`;
   const click = (pl.espn_id || pl.sleeper_id) ? "clickable" : "";
   const val = pl.value != null ? `<span class="rcell-val">${fmtVal(pl.value)}</span>` : "";
-  const sub = (pl.pos_rank != null || pl.trend) ? `<div class="rcell-sub2">${posRankStr(pl)} ${trendArrow(pl.trend)}</div>` : "";
+  const oppTxt = pl.opp ? `${esc(pl.opp_ha || "vs")} ${esc(pl.opp)}` : "";
+  const sub = (pl.pos_rank != null || pl.trend || oppTxt)
+    ? `<div class="rcell-sub2">${posRankStr(pl)}${oppTxt ? (pl.pos_rank != null ? " · " : "") + oppTxt : ""} ${trendArrow(pl.trend)}</div>` : "";
   return `<div class="rcell ${posClass(pos)} ${click}" ${data}>
-      <div class="rcell-top"><span>${esc(posLabel(pos))} · ${esc(pl.team || "FA")}</span>${val}</div>
-      <div class="rcell-name">${esc(abbrevName(pl.name))}</div>
+      <div class="rcell-top"><span>${teamLogo(pl.team)}${esc(posLabel(pos))} · ${esc(pl.team || "FA")}</span>${val}</div>
+      <div class="rcell-name">${esc(abbrevName(pl.name))}${injBadge(pl)}</div>
       ${sub}
     </div>`;
 }
@@ -952,8 +1031,8 @@ function renderPlayer(p) {
     : "";
   const head = `<div class="pp-head">
       ${p.headshot ? `<img class="pp-shot" src="${esc(p.headshot)}" alt="" onerror="this.style.display='none'">` : ""}
-      <div><div class="pp-name">${esc(p.name)}</div>
-      <div class="pp-sub">${posBadge(p.pos)} ${esc(p.team || "")}
+      <div><div class="pp-name">${esc(p.name)} ${injBadge(p)}</div>
+      <div class="pp-sub">${posBadge(p.pos)} ${teamLogo(p.team)} ${esc(p.team || "")}
         ${p.value != null ? `<span class="pp-val">${fmtVal(p.value)} · ${posRankStr(p)} ${trendArrow(p.trend)}</span>` : ""}
       </div></div>
     </div>`;
@@ -1006,7 +1085,7 @@ function renderPlayer(p) {
     const host = modalBody.querySelector("#glhost");
     host.innerHTML = `<div class="loading">Loading ${sel.value}…</div>`;
     try {
-      const r = await fetch(`/api/player/gamelog?espn_id=${encodeURIComponent(p.espn_id || "")}&season=${sel.value}`, { cache: "no-store" });
+      const r = await fetch(`/api/player/gamelog?espn_id=${encodeURIComponent(p.espn_id || "")}&sleeper_id=${encodeURIComponent(p.sleeper_id || "")}&season=${sel.value}`, { cache: "no-store" });
       host.innerHTML = gamelogTable(await r.json());
     } catch (e) { host.innerHTML = `<div class="err-msg">Could not load ${sel.value}</div>`; }
   });
@@ -1061,6 +1140,15 @@ async function openPlayer(d) {
 }
 
 grid.addEventListener("click", e => {
+  const pg = e.target.closest(".pgbtn");
+  if (pg) {
+    const key = pg.dataset.key, ms = leagueMatchups(lastData.leagues[parseInt(key.replace("lg", ""), 10)]);
+    cardIdx[key] = (((cardIdx[key] || 0) + parseInt(pg.dataset.dir, 10)) % ms.length + ms.length) % ms.length;
+    renderCards();
+    return;
+  }
+  const ex = e.target.closest(".expand-btn");
+  if (ex) { openFocus(parseInt(ex.dataset.idx, 10)); return; }
   const lb = e.target.closest(".lab-btn");
   if (lb) { openLab(lb.dataset.id, lb.dataset.name); return; }
   const oc = e.target.closest(".opt-chip");
@@ -1071,6 +1159,26 @@ grid.addEventListener("click", e => {
   if (btn) { openRosters(btn.dataset.id, btn.dataset.name); return; }
 });
 document.getElementById("rootingBtn").addEventListener("click", openRooting);
+
+/* ---------- light / dark toggle ---------- */
+const themeBtn = document.getElementById("themeBtn");
+function effectiveTheme() {
+  const s = document.documentElement.dataset.theme;
+  if (s) return s;
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+function updateThemeBtn() {
+  const dark = effectiveTheme() === "dark";
+  themeBtn.textContent = dark ? "☀️" : "🌙";
+  themeBtn.title = dark ? "Switch to light mode" : "Switch to dark mode";
+}
+themeBtn.addEventListener("click", () => {
+  const next = effectiveTheme() === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  store.set("theme", next);
+  updateThemeBtn();
+});
+updateThemeBtn();
 document.body.addEventListener("click", e => {
   const row = e.target.closest(".prow.clickable, .rcell.clickable");
   if (row) openPlayer(row.dataset);

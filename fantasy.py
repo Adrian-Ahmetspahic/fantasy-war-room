@@ -123,6 +123,25 @@ def canon_team(abbr):
     return TEAM_ALIAS.get(a, a)
 
 
+# Injury / availability status -> short code shown on player rows.
+_INJURY = {
+    "QUESTIONABLE": "Q", "DOUBTFUL": "D", "OUT": "O",
+    "IR": "IR", "INJURY_RESERVE": "IR",
+    "SUS": "SUS", "SUSPENSION": "SUS", "PUP": "PUP",
+    "DAY_TO_DAY": "DTD", "DTD": "DTD", "COV": "COV", "COVID": "COV",
+    "NA": "NA", "DNR": "DNR", "PROBABLE": "P",
+}
+
+
+def _injury_code(s):
+    if not s:
+        return None
+    key = str(s).upper().replace(" ", "_")
+    if key in ("ACTIVE", "NORMAL", ""):
+        return None
+    return _INJURY.get(key, str(s)[:3].upper())
+
+
 _nfl_cache = {"ts": 0, "data": {}}
 
 
@@ -148,16 +167,20 @@ def nfl_game_status(force=False):
             rz = bool(situation.get("isRedZone"))
             # team that currently has possession (for red-zone attribution)
             poss_id = situation.get("possession")
+            comps = []
             for c in comp.get("competitors", []):
                 team = c.get("team", {})
                 abbr = canon_team(team.get("abbreviation"))
-                if not abbr:
-                    continue
-                team_rz = rz and str(team.get("id")) == str(poss_id)
+                if abbr:
+                    comps.append((abbr, c.get("homeAway"), team))
+            for i, (abbr, ha, team) in enumerate(comps):
+                other = comps[1 - i][0] if len(comps) == 2 else None
                 out[abbr] = {
                     "status": state,
                     "detail": detail,
-                    "redzone": team_rz,
+                    "redzone": rz and str(team.get("id")) == str(poss_id),
+                    "opp": other,
+                    "ha": "@" if ha == "away" else "vs",
                 }
     except Exception as e:  # scoreboard is best-effort; never fatal
         print(f"[nfl] scoreboard fetch failed: {e}")
@@ -249,15 +272,21 @@ def _sl_player(pid, players, pts, projections, nfl, starter):
         team = canon_team(meta.get("team"))
     g = nfl.get(team, {})
     espn_id = meta.get("espn_id")
+    pts_val = round(pts.get(str(pid), 0) or 0, 2)
+    proj_val = projections.get(str(pid))
     return {
         "name": nm,
         "pos": pos,
         "team": team,
-        "points": round(pts.get(str(pid), 0) or 0, 2),
-        "projected": projections.get(str(pid)),
+        "points": pts_val,
+        "projected": proj_val,
+        "proj_live": _live_proj(g.get("status", "pre"), g.get("detail", ""), pts_val, proj_val),
         "game_status": g.get("status", "pre"),
         "game_detail": g.get("detail", ""),
         "redzone": g.get("redzone", False),
+        "opp": g.get("opp"),
+        "opp_ha": g.get("ha"),
+        "injury": _injury_code(meta.get("injury_status")),
         "starter": starter,
         "sleeper_id": str(pid) if str(pid) not in ("0", "") and pid is not None else None,
         "espn_id": str(espn_id) if espn_id else None,
@@ -338,8 +367,6 @@ def sleeper_league_payload(league_id, my_user_id, week, players, nfl):
             my_roster_id = r["roster_id"]
             break
 
-    by_roster = {m["roster_id"]: m for m in matchups}
-    mine = by_roster.get(my_roster_id)
     base = {
         "provider": "sleeper",
         "league_id": str(league_id),
@@ -347,27 +374,49 @@ def sleeper_league_payload(league_id, my_user_id, week, players, nfl):
         "league_name": league.get("name", "Sleeper league"),
         "week": week,
     }
-    if not mine:
-        base["error"] = "Could not find your team in this league for the current week."
-        return base
 
-    mid = mine.get("matchup_id")
-    opp = None
-    for m in matchups:
-        if m.get("matchup_id") == mid and m["roster_id"] != my_roster_id:
-            opp = m
-            break
-
-    base["my_team"] = _sl_build_team(mine, roster_by_id.get(my_roster_id),
-                                     user_name, players, projections, nfl, slots)
-    base["opp_team"] = _sl_build_team(
-        opp, roster_by_id.get(opp["roster_id"]) if opp else None,
-        user_name, players, projections, nfl, slots)
+    # build every team, enrich, and pair into matchups
     fc = fantasycalc_values(num_teams=len(rosters))
-    for t in (base["my_team"], base["opp_team"]):
-        if t:
-            _fc_enrich_team(t, fc)
+    by_mid, meta_by_roster = {}, {}
+    for m in matchups:
+        r = roster_by_id.get(m["roster_id"])
+        t = _sl_build_team(m, r, user_name, players, projections, nfl, slots)
+        if not t:
+            continue
+        _fc_enrich_team(t, fc)
+        meta = {"team": t, "is_me": bool(r) and r.get("owner_id") == my_user_id}
+        meta_by_roster[m["roster_id"]] = meta
+        by_mid.setdefault(m.get("matchup_id"), []).append(meta)
+
+    base["matchups"] = _pair_matchups(by_mid)
+    mine = meta_by_roster.get(my_roster_id)
+    if not mine:
+        if not base["matchups"]:
+            base["error"] = "Could not find matchups in this league for the current week."
+        return base
+    # keep my_team/opp_team for the rest of the app
+    for mu in base["matchups"]:
+        if mu["a_is_me"] or mu["b_is_me"]:
+            base["my_team"] = mu["a"] if mu["a_is_me"] else mu["b"]
+            base["opp_team"] = mu["b"] if mu["a_is_me"] else mu["a"]
+            break
     return base
+
+
+def _pair_matchups(by_mid):
+    """Turn {matchup_id: [meta, meta]} into a list of matchups, mine first."""
+    out = []
+    for _, pair in by_mid.items():
+        if len(pair) != 2:
+            continue
+        a, b = pair
+        if b["is_me"]:
+            a, b = b, a
+        out.append({"a": a["team"], "b": b["team"],
+                    "a_is_me": a["is_me"], "b_is_me": b["is_me"],
+                    "win_prob": win_probability(a["team"], b["team"])})
+    out.sort(key=lambda x: 0 if (x["a_is_me"] or x["b_is_me"]) else 1)
+    return out
 
 
 def sleeper_all_rosters(league_id, week, players, nfl, my_user_id=None):
@@ -501,9 +550,14 @@ def _espn_build_team(t, week, nfl):
             "team": team,
             "points": actual,
             "projected": round(proj, 2) if proj is not None else None,
+            "proj_live": _live_proj(g.get("status", "pre"), g.get("detail", ""),
+                                    actual, round(proj, 2) if proj is not None else None),
             "game_status": g.get("status", "pre"),
             "game_detail": g.get("detail", ""),
             "redzone": g.get("redzone", False),
+            "opp": g.get("opp"),
+            "opp_ha": g.get("ha"),
+            "injury": _injury_code(p.get("injuryStatus")),
             "starter": not is_bench,
             "espn_id": str(p.get("id")) if p.get("id") else None,
             "sleeper_id": None,
@@ -543,26 +597,38 @@ def espn_league_payload(league_id, espn_s2, swid, season, week, nfl):
     }
 
     my_team_id = _espn_my_team_id(league, swid)
-    if my_team_id is None:
-        base["error"] = "Could not match your SWID to a team. Check the SWID cookie."
-        return base
+    fc = fantasycalc_values(num_teams=len(teams))
+    built = {}
 
-    opp_id = None
+    def team_meta(tid):
+        if tid not in built:
+            t = _espn_build_team(teams.get(tid), week, nfl)
+            if t:
+                _fc_enrich_team(t, fc)
+            built[tid] = {"team": t, "is_me": tid == my_team_id} if t else None
+        return built[tid]
+
+    by_mid = {}
     for g in league.get("schedule", []):
         if g.get("matchupPeriodId") != week:
             continue
         home = (g.get("home") or {}).get("teamId")
         away = (g.get("away") or {}).get("teamId")
-        if my_team_id in (home, away):
-            opp_id = away if home == my_team_id else home
-            break
+        if home is None or away is None:
+            continue
+        ma, mb = team_meta(home), team_meta(away)
+        if ma and mb:
+            by_mid[g.get("id") or (home, away)] = [ma, mb]
 
-    base["my_team"] = _espn_build_team(teams.get(my_team_id), week, nfl)
-    base["opp_team"] = _espn_build_team(teams.get(opp_id), week, nfl)
-    fc = fantasycalc_values(num_teams=len(teams))
-    for t in (base["my_team"], base["opp_team"]):
-        if t:
-            _fc_enrich_team(t, fc)
+    base["matchups"] = _pair_matchups(by_mid)
+    if my_team_id is None:
+        base["error"] = "Could not match your SWID to a team. Check the SWID cookie."
+        return base
+    for mu in base["matchups"]:
+        if mu["a_is_me"] or mu["b_is_me"]:
+            base["my_team"] = mu["a"] if mu["a_is_me"] else mu["b"]
+            base["opp_team"] = mu["b"] if mu["a_is_me"] else mu["a"]
+            break
     return base
 
 
@@ -594,23 +660,18 @@ def espn_all_rosters(league_id, espn_s2, swid, season, week, nfl):
 # projection + win-probability helpers (shared)
 # --------------------------------------------------------------------------
 def _team_projection(players, actual_total):
-    """Projected final = points already scored by done/live players +
-    projection for players who haven't finished. Falls back to actual when
-    no projection data is available for a player."""
+    """Projected final = sum of each player's live projection (banked points +
+    projection scaled by game time left). Falls back to actual points for
+    players with no projection."""
     total = 0.0
     have_any = False
     for p in players:
-        proj = p.get("projected")
-        status = p.get("game_status")
-        pts = p.get("points") or 0
-        if status == "post":
-            total += pts
-        elif proj is not None:
+        lv = p.get("proj_live")
+        if lv is not None:
+            total += lv
             have_any = True
-            # once a game is live, blend what's banked with remaining projection
-            total += max(pts, proj) if status == "in" else proj
         else:
-            total += pts
+            total += p.get("points") or 0
     if not have_any and actual_total:
         return None  # no projection data -> let frontend hide it
     return round(total, 2)
@@ -638,18 +699,35 @@ def _game_frac_remaining(status, detail):
     d = (detail or "").lower()
     if "final" in d:
         return 0.0
-    if "half" in d:
+    if "half" in d:                          # halftime
         return 0.5
     if "ot" in d or "overtime" in d:
         return 0.08
-    m = _re.search(r"q([1-4])", d)
+    # quarter can read "q2 4:12" or "4:12 - 2nd"
+    m = _re.search(r"q\s*([1-4])", d) or _re.search(r"\b([1-4])(?:st|nd|rd|th)\b", d)
     if m:
         q = int(m.group(1))
         cm = _re.search(r"(\d{1,2}):(\d{2})", d)
         secs = int(cm.group(1)) * 60 + int(cm.group(2)) if cm else 450
+        if "end" in d:                       # end of quarter -> no time left in it
+            secs = 0
         quarters_left = (4 - q) + secs / 900.0   # 900s per quarter
         return max(0.0, min(1.0, quarters_left / 4.0))
     return 0.5                        # live but detail unparsable
+
+
+def _live_proj(status, detail, points, proj):
+    """A live projected final: points banked so far + the pre-game projection
+    scaled by how much of the player's game is left. Pre-game it equals the
+    projection; final it equals the actual points."""
+    if proj is None:
+        return None
+    if status == "post":
+        return round(points or 0, 1)
+    if status != "in":
+        return round(proj, 1)
+    frac = _game_frac_remaining(status, detail)
+    return round((points or 0) + proj * frac, 1)
 
 
 def _team_remaining_var(team):
@@ -913,6 +991,104 @@ def espn_gamelog(espn_id, season=None):
     return {"season": season, "seasons": seasons, "columns": columns, "rows": rows}
 
 
+# Sleeper weekly-stats game log -- reliable fallback when ESPN's gamelog is
+# empty (it is, for some veterans). (key, label, group, dir)
+_SLEEPER_GL_COLS = [
+    ("fpts", "FPTS", "FANTASY", "high"),
+    ("pass_cmp", "CMP", "PASSING", "high"), ("pass_att", "ATT", "PASSING", "high"),
+    ("pass_yd", "YDS", "PASSING", "high"), ("pass_td", "TD", "PASSING", "high"),
+    ("pass_int", "INT", "PASSING", "low"),
+    ("rush_att", "CAR", "RUSHING", "high"), ("rush_yd", "YDS", "RUSHING", "high"),
+    ("rush_td", "TD", "RUSHING", "high"),
+    ("rec_tgt", "TGT", "RECEIVING", "high"), ("rec", "REC", "RECEIVING", "high"),
+    ("rec_yd", "YDS", "RECEIVING", "high"), ("rec_td", "TD", "RECEIVING", "high"),
+    ("fum_lost", "FL", "FUMBLES", "low"),
+]
+
+
+def _logo_url(team):
+    if not team:
+        return None
+    code = {"WAS": "wsh"}.get(team, team).lower()
+    return f"https://a.espncdn.com/i/teamlogos/nfl/500/{code}.png"
+
+
+def sleeper_gamelog(sleeper_id, season):
+    data = _get_json(f"https://api.sleeper.com/stats/nfl/player/{sleeper_id}"
+                     f"?season_type=regular&season={season}&grouping=week", timeout=20)
+    if not isinstance(data, dict):
+        return {"season": str(season), "columns": [], "rows": []}
+    weeks = sorted((int(w) for w in data if data.get(w)))
+    present = set()
+    for w in data.values():
+        st = (w or {}).get("stats") or {}
+        for key, _, _, _ in _SLEEPER_GL_COLS:
+            if key != "fpts" and st.get(key):
+                present.add(key)
+    cols = [c for c in _SLEEPER_GL_COLS if c[0] == "fpts" or c[0] in present]
+    columns = [{"label": c[1], "name": c[0], "group": c[2], "dir": c[3]} for c in cols]
+    rows = []
+    for wk in weeks:
+        e = data[str(wk)]
+        st = e.get("stats") or {}
+        fpts = round(st.get("pts_ppr", 0) or 0, 1)
+        vals = []
+        for c in cols:
+            if c[0] == "fpts":
+                vals.append(fpts)
+            else:
+                v = st.get(c[0])
+                vals.append(round(v, 1) if isinstance(v, (int, float)) else "")
+        opp = canon_team(e.get("opponent"))
+        rows.append({
+            "week": wk, "atVs": "@" if e.get("is_away_team") else "vs",
+            "opp": opp, "opp_logo": _logo_url(opp),
+            "result": None, "score": None, "fpts": fpts,
+            "values": vals, "playoff": False,
+        })
+    return {"season": str(season), "columns": columns, "rows": rows}
+
+
+def player_gamelog(espn_id, sleeper_id, season=None):
+    """Unified game log: ESPN when it returns data, else Sleeper weekly stats."""
+    seasons = None
+    if espn_id:
+        try:
+            seasons = espn_gamelog(espn_id, None).get("seasons")
+        except Exception:
+            seasons = None
+    target = season or (seasons[0] if seasons else None)
+
+    def rows_for(yr):
+        if espn_id:
+            try:
+                gl = espn_gamelog(espn_id, yr)
+                if gl.get("rows"):
+                    return gl
+            except Exception as e:
+                print(f"[gamelog] espn {yr} failed: {e}")
+        if sleeper_id and yr:
+            try:
+                sg = sleeper_gamelog(sleeper_id, yr)
+                if sg.get("rows"):
+                    return sg
+            except Exception as e:
+                print(f"[gamelog] sleeper {yr} failed: {e}")
+        return None
+
+    gl = rows_for(target)
+    # newest season empty (e.g. season just started) -> show last one with games
+    if not gl and not season and seasons:
+        for yr in seasons[1:]:
+            gl = rows_for(yr)
+            if gl:
+                break
+    gl = gl or {"season": str(target) if target else None, "columns": [], "rows": []}
+    gl["seasons"] = seasons or ([gl.get("season")] if gl.get("season") else [])
+    gl["season"] = gl.get("season") or (str(target) if target else None)
+    return gl
+
+
 def espn_news(espn_id, count=6):
     j = _get_json(
         f"https://site.api.espn.com/apis/fantasy/v2/games/ffl/news/players"
@@ -1143,8 +1319,10 @@ def player_profile(espn_id, sleeper_id, team, pos, name, season):
     }
     jobs = {}
     with _Pool(max_workers=6) as ex:
+        if espn_id or sleeper_id:
+            # None -> builder auto-selects the latest season with games
+            jobs["gamelog"] = ex.submit(player_gamelog, espn_id, sleeper_id, None)
         if espn_id:
-            jobs["gamelog"] = ex.submit(espn_gamelog, espn_id, season)
             jobs["espn_news"] = ex.submit(espn_news, espn_id)
             jobs["depth"] = ex.submit(espn_depth_chart, team, season, espn_id)
         if sleeper_id:
@@ -1159,15 +1337,6 @@ def player_profile(espn_id, sleeper_id, team, pos, name, season):
                 vals[k] = None
 
     gl = vals.get("gamelog")
-    # if the current season has no games yet, fall back to the last one that does
-    if isinstance(gl, dict) and not gl.get("rows"):
-        seasons = gl.get("seasons") or []
-        alt = next((s for s in seasons if s != gl.get("season")), None)
-        if alt and espn_id:
-            try:
-                gl = espn_gamelog(espn_id, alt)
-            except Exception:
-                pass
     result["gamelog"] = gl if isinstance(gl, dict) else None
     result["seasons"] = (gl or {}).get("seasons") if isinstance(gl, dict) else []
     result["news"] = {"espn": vals.get("espn_news") or [],
@@ -1182,6 +1351,12 @@ def player_profile(espn_id, sleeper_id, team, pos, name, season):
         result["trend"] = e["trend"] if e else None
     except Exception as e:
         print(f"[profile] value lookup failed: {e}")
+    try:
+        if sleeper_id:
+            meta = sleeper_players().get(str(sleeper_id)) or {}
+            result["injury"] = _injury_code(meta.get("injury_status"))
+    except Exception:
+        pass
     return result
 
 

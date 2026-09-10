@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>My Fantasy Dashboard</title>
+  <script>try{var t=localStorage.getItem('theme');if(t)document.documentElement.dataset.theme=t;}catch(e){}</script>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -16,6 +17,7 @@
     <div class="controls">
       <span class="summary" id="summary"></span>
       <span class="updated" id="updated"></span>
+      <button id="themeBtn" class="ghost" aria-label="Toggle theme" title="Toggle theme"></button>
       <button id="rootingBtn" class="ghost">🔥 Rooting guide</button>
       <label class="auto"><input type="checkbox" id="benches"> benches</label>
       <label class="auto">
