@@ -1460,7 +1460,11 @@ def dk_props(force=False):
                     idx.setdefault(_norm_name(nm), {"name": nm})["td"] = \
                         _clean_odds((s.get("displayOdds") or {}).get("american"))
             else:
-                if "Yards" not in mt:
+                if "Yards" in mt:
+                    subkey = kind          # pass_yds / rush_yds / rec_yds
+                elif "Reception" in mt:
+                    subkey = "rec"         # receptions (for PPR)
+                else:
                     continue
                 nm = None
                 for s in sels:
@@ -1476,7 +1480,7 @@ def dk_props(force=False):
                         ladder.append((float(mv), _clean_odds(am)))
                 if ladder:
                     ladder.sort()
-                    idx.setdefault(_norm_name(nm), {"name": nm})[kind] = ladder
+                    idx.setdefault(_norm_name(nm), {"name": nm})[subkey] = ladder
     _DK_CACHE["ts"] = time.time()
     _DK_CACHE["idx"] = idx
     return idx
@@ -1673,20 +1677,27 @@ def sleeper_trending(kind="add", limit=25):
 
 
 def _vegas_fp(e):
-    """Rough expected fantasy points implied by DraftKings lines."""
-    fp, have = 0.0, False
+    """Rough expected (PPR) fantasy points implied by DraftKings lines.
+    Needs at least one yardage market -- TD odds alone can't project a player,
+    and early in the week DraftKings often has only anytime-TD posted."""
+    fp, have_yd = 0.0, False
     for kind, mult in (("pass_yds", 0.04), ("rush_yds", 0.1), ("rec_yds", 0.1)):
         if kind in e:
             L = _implied_line(e[kind])
             if L:
                 fp += L * mult
-                have = True
+                have_yd = True
+    if not have_yd:
+        return None
+    if "rec" in e:                       # PPR: +1 per implied reception
+        R = _implied_line(e["rec"])
+        if R:
+            fp += R
     if e.get("td") is not None:
         p = _implied_prob(e["td"])
         if p:
             fp += p * 6
-            have = True
-    return round(fp, 1) if have else None
+    return round(fp, 1)
 
 
 def _dk_enrich_team(t, dk):

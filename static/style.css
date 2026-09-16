@@ -221,6 +221,45 @@ body.show-bench .bench { display: block; }
 .modal-close:hover { color: var(--ink); }
 .modal-body { padding: 6px 0 10px; }
 .loading { padding: 24px; text-align: center; color: var(--muted); }
+
+/* ===== multi-tab player profile window ===== */
+#pmodal { z-index: 60; }   /* stacks above the main modal (trade/rosters/lab) */
+.pm-card { display: flex; flex-direction: column; max-height: calc(100vh - 80px); }
+.pm-bar {
+  display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+  border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--card); z-index: 2;
+}
+.pm-tabs { display: flex; gap: 4px; overflow-x: auto; flex: 1; min-width: 0; }
+.pm-tab {
+  display: flex; align-items: center; gap: 6px; white-space: nowrap; cursor: pointer;
+  font-size: 12.5px; font-weight: 600; color: var(--muted);
+  padding: 5px 9px; border-radius: 8px 8px 0 0; border: 1px solid transparent; border-bottom: none;
+}
+.pm-tab:hover { background: rgba(127,127,127,.08); color: var(--ink); }
+.pm-tab.active { color: var(--ink); background: var(--bg); border-color: var(--line); }
+.pm-tab-name { max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
+.pm-tab-x { color: var(--muted); font-size: 11px; border-radius: 4px; padding: 0 3px; }
+.pm-tab-x:hover { background: var(--lose); color: #fff; }
+.pm-search { position: relative; flex: 0 0 auto; }
+.pm-search input {
+  font: inherit; font-size: 13px; border: 1px solid var(--line); background: var(--bg);
+  color: var(--ink); border-radius: 8px; padding: 6px 10px; width: 180px;
+}
+.pm-search input:focus { outline: none; border-color: var(--me); }
+.pm-results {
+  position: absolute; top: 100%; right: 0; margin-top: 4px; width: 260px; max-height: 320px;
+  overflow-y: auto; background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: var(--shadow); z-index: 5;
+}
+.pm-result { display: flex; align-items: center; gap: 8px; padding: 7px 10px; cursor: pointer; font-size: 13px; border-bottom: 1px solid var(--line); }
+.pm-result:last-child { border-bottom: none; }
+.pm-result:hover { background: rgba(29,110,245,.08); }
+.pm-result.empty { color: var(--muted); cursor: default; justify-content: center; }
+.pmr-name { font-weight: 600; }
+.pm-result small { color: var(--muted); margin-left: auto; }
+.pm-body { overflow-y: auto; }
+.tl-name.pm-open { cursor: pointer; }
+.tl-name.pm-open:hover { text-decoration: underline; color: var(--me); }
 .rteam { border-bottom: 1px solid var(--line); }
 .rteam > summary {
   display: flex; align-items: center; justify-content: space-between;

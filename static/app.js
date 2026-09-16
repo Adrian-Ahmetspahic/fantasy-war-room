@@ -414,10 +414,12 @@ function labBuySell(d) {
     </div>`;
 }
 function labVegas(d) {
+  if (!d.vegas_edge.over.length && !d.vegas_edge.under.length)
+    return `<div class="empty">DraftKings hasn't posted player yardage props for this week yet — they usually go up mid-week. Check back closer to game day.</div>`;
   const list = arr => arr.length ? arr.map(p => `<div class="lab-row">
       ${posBadge(p.pos)}<span class="lab-name">${esc(p.name)} <small>${esc(p.owner)}</small></span>
       <span class="ve-nums">proj ${p.proj} · vegas ${p.vegas_fp} <b class="${p.edge >= 0 ? "pos" : "neg"}">${p.edge >= 0 ? "+" : ""}${p.edge}</b></span></div>`).join("") : `<div class="empty">–</div>`;
-  return `<div class="lab-note">Vegas-implied fantasy points vs. projection (edge). Positive = Vegas likes them more than the projection.</div>
+  return `<div class="lab-note">Vegas-implied fantasy points (PPR) vs. projection. Positive = Vegas likes them more than the projection.</div>
     <div class="root-wrap">
       <div class="root-col"><div class="sec-label" style="background:#16a34a">VEGAS OVER PROJECTION</div>${list(d.vegas_edge.over)}</div>
       <div class="root-col"><div class="sec-label" style="background:#dc2626">VEGAS UNDER PROJECTION</div>${list(d.vegas_edge.under)}</div>
@@ -636,7 +638,7 @@ function tradeSideList(side) {
       ? `<span class="tl-block ${T.block.has(String(key)) ? "on" : ""}" data-key="${esc(String(key))}" title="Trade block">★</span>` : "";
     return `<label class="tl-row ${set.has(key) ? "on" : ""}">
         <input type="checkbox" data-side="${side}" data-key="${esc(String(key))}" ${set.has(key) ? "checked" : ""}>
-        ${posBadge(p.slot || p.pos)}<span class="tl-name">${esc(p.name)}</span>${val}${trendArrow(p.trend)}${blockStar}
+        ${posBadge(p.slot || p.pos)}<span class="tl-name pm-open" data-espn="${esc(p.espn_id || "")}" data-sleeper="${esc(p.sleeper_id || "")}" data-team="${esc(p.team || "")}" data-pos="${esc(p.pos || "")}" data-name="${esc(p.name || "")}">${esc(p.name)}</span>${val}${trendArrow(p.trend)}${blockStar}
       </label>`;
   }).join("");
   return `<div class="trade-list">${rows}</div>`;
@@ -1038,8 +1040,82 @@ function depthChart(dp) {
       </div>`).join("")}</div>`;
 }
 
-function renderPlayer(p) {
-  curPlayer = p;
+/* ===== multi-tab player profile window (#pmodal) ===== */
+const pmodal = document.getElementById("pmodal");
+const pmBody = document.getElementById("pmBody");
+const pmTabsEl = document.getElementById("pmTabs");
+let pmTabs = [];          // [{key, name, d, data, err, avail, odds, panel}]
+let pmActiveKey = null;
+
+function pmKey(d) { return String(d.espn || d.sleeper || ("n:" + (d.name || ""))); }
+
+function openPlayer(d) {
+  const key = pmKey(d);
+  let tab = pmTabs.find(t => t.key === key);
+  if (!tab) {
+    tab = { key, name: d.name || "Player", d, data: null, err: null,
+            avail: null, odds: null, panel: "log" };
+    pmTabs.push(tab);
+    fetchProfile(tab);
+  }
+  pmActiveKey = key;
+  pmodal.hidden = false;
+  renderPmTabs();
+  renderPmBody();
+}
+
+async function fetchProfile(tab) {
+  const d = tab.d;
+  const qs = new URLSearchParams({ espn_id: d.espn || "", sleeper_id: d.sleeper || "",
+    team: d.team || "", pos: d.pos || "", name: d.name || "" });
+  try {
+    const r = await fetch("/api/player?" + qs.toString(), { cache: "no-store" });
+    const p = await r.json();
+    if (p.error) tab.err = p.error;
+    else { tab.data = p; tab.name = p.name || tab.name; }
+  } catch (e) { tab.err = String(e); }
+  if (pmActiveKey === tab.key) { renderPmTabs(); renderPmBody(); }
+}
+
+function renderPmTabs() {
+  pmTabsEl.innerHTML = pmTabs.map(t =>
+    `<div class="pm-tab ${t.key === pmActiveKey ? "active" : ""}" data-key="${esc(t.key)}">
+       <span class="pm-tab-name">${esc(t.name)}</span>
+       <span class="pm-tab-x" data-close="${esc(t.key)}">✕</span>
+     </div>`).join("");
+}
+
+function renderPmBody() {
+  const tab = pmTabs.find(t => t.key === pmActiveKey);
+  if (!tab) { pmBody.innerHTML = ""; return; }
+  if (tab.err) { pmBody.innerHTML = `<div class="err-msg">${esc(tab.err)}</div>`; return; }
+  if (!tab.data) { pmBody.innerHTML = `<div class="loading">Loading ${esc(tab.name)}…</div>`; return; }
+  renderPlayerInto(tab);
+}
+
+function closePmTab(key) {
+  const i = pmTabs.findIndex(t => t.key === key);
+  if (i < 0) return;
+  pmTabs.splice(i, 1);
+  if (pmActiveKey !== key) { renderPmTabs(); return; }
+  const next = pmTabs[i] || pmTabs[i - 1];
+  if (next) { pmActiveKey = next.key; renderPmTabs(); renderPmBody(); }
+  else { closePmWindow(); }
+}
+
+function closePmWindow() {
+  pmodal.hidden = true;
+  pmTabs = [];
+  pmActiveKey = null;
+  pmBody.innerHTML = "";
+  pmTabsEl.innerHTML = "";
+  const res = document.getElementById("pmResults");
+  if (res) res.hidden = true;
+}
+
+function renderPlayerInto(tab) {
+  const p = tab.data;
+  const panel = tab.panel || "log";
   const gl = p.gamelog || {};
   const seasonSel = (p.seasons && p.seasons.length)
     ? `<select id="glseason">${p.seasons.map(s => `<option ${String(s) === String(gl.season) ? "selected" : ""}>${esc(s)}</option>`).join("")}</select>`
@@ -1051,56 +1127,47 @@ function renderPlayer(p) {
         ${p.value != null ? `<span class="pp-val">${fmtVal(p.value)} · ${posRankStr(p)} ${trendArrow(p.trend)}</span>` : ""}
       </div></div>
     </div>`;
-  const tabs = `<div class="ptabs">
-      <button class="ptab active" data-panel="log">Game Log</button>
-      <button class="ptab" data-panel="news">News &amp; Outlook</button>
-      <button class="ptab" data-panel="depth">Depth Chart</button>
-      <button class="ptab" data-panel="odds">Vegas</button>
-    </div>`;
-  const logPanel = `<div class="ppanel" data-panel="log">
+  const pane = (name, label) => `<button class="ptab ${panel === name ? "active" : ""}" data-panel="${name}">${label}</button>`;
+  const tabsBar = `<div class="ptabs">${pane("log", "Game Log")}${pane("news", "News &amp; Outlook")}${pane("depth", "Depth Chart")}${pane("odds", "Vegas")}</div>`;
+  const logPanel = `<div class="ppanel" data-panel="log" ${panel === "log" ? "" : "hidden"}>
       <div class="panel-bar">Season ${seasonSel}</div>
       <div id="glhost">${gamelogTable(gl)}</div>
     </div>`;
-  const newsPanel = `<div class="ppanel" data-panel="news" hidden>
+  const newsPanel = `<div class="ppanel" data-panel="news" ${panel === "news" ? "" : "hidden"}>
       <div class="sec-label espn">ESPN</div>${newsList(p.news.espn)}
       <div class="sec-label sleeper">SLEEPER</div>${newsList(p.news.sleeper)}
       ${outlookBlock(p.outlook && p.outlook.sleeper)}
     </div>`;
-  const depthPanel = `<div class="ppanel" data-panel="depth" hidden>
+  const depthPanel = `<div class="ppanel" data-panel="depth" ${panel === "depth" ? "" : "hidden"}>
       <div class="panel-bar">${esc(p.team || "")} depth chart</div>
       ${depthChart(p.depth)}
     </div>`;
-  const oddsPanel = `<div class="ppanel" data-panel="odds" hidden>
+  const oddsPanel = `<div class="ppanel" data-panel="odds" ${panel === "odds" ? "" : "hidden"}>
       <div id="oddsHost"><div class="loading">Loading odds…</div></div>
     </div>`;
-
   const availBlock = `<div id="availHost" class="avail"><div class="avail-loading">Checking your leagues…</div></div>`;
 
-  modalTitle.textContent = p.name;
-  modalBody.innerHTML = head + availBlock + tabs + logPanel + newsPanel + depthPanel + oddsPanel;
-  loadAvailability(p);
+  pmBody.scrollTop = 0;
+  pmBody.innerHTML = head + availBlock + tabsBar + logPanel + newsPanel + depthPanel + oddsPanel;
 
-  modalBody.querySelectorAll(".ptab").forEach(btn => {
+  if (tab.avail) renderAvail(tab.avail); else loadAvailability(tab);
+  if (panel === "odds") { if (tab.odds) renderOdds(tab.odds); else loadOdds(tab); }
+
+  pmBody.querySelectorAll(".ptab").forEach(btn => {
     btn.addEventListener("click", () => {
-      modalBody.querySelectorAll(".ptab").forEach(b => b.classList.toggle("active", b === btn));
-      modalBody.querySelectorAll(".ppanel").forEach(pan =>
+      tab.panel = btn.dataset.panel;
+      pmBody.querySelectorAll(".ptab").forEach(b => b.classList.toggle("active", b === btn));
+      pmBody.querySelectorAll(".ppanel").forEach(pan =>
         pan.hidden = pan.dataset.panel !== btn.dataset.panel);
       if (btn.dataset.panel === "odds") {
-        const host = modalBody.querySelector("#oddsHost");
-        if (host && !host.dataset.loaded) { host.dataset.loaded = "1"; loadOdds(p); }
+        if (tab.odds) renderOdds(tab.odds);
+        else { const host = pmBody.querySelector("#oddsHost"); if (host && !host.dataset.loaded) { host.dataset.loaded = "1"; loadOdds(tab); } }
       }
     });
   });
-  modalBody.querySelectorAll(".news-more").forEach(link => {
-    link.addEventListener("click", () => {
-      const item = link.closest(".news-item");
-      const open = item.classList.toggle("open");
-      link.textContent = open ? "Show less" : "Show more";
-    });
-  });
-  const sel = modalBody.querySelector("#glseason");
+  const sel = pmBody.querySelector("#glseason");
   if (sel) sel.addEventListener("change", async () => {
-    const host = modalBody.querySelector("#glhost");
+    const host = pmBody.querySelector("#glhost");
     host.innerHTML = `<div class="loading">Loading ${sel.value}…</div>`;
     try {
       const r = await fetch(`/api/player/gamelog?espn_id=${encodeURIComponent(p.espn_id || "")}&sleeper_id=${encodeURIComponent(p.sleeper_id || "")}&season=${sel.value}`, { cache: "no-store" });
@@ -1110,7 +1177,7 @@ function renderPlayer(p) {
 }
 
 function renderOdds(o) {
-  const host = modalBody.querySelector("#oddsHost");
+  const host = pmBody.querySelector("#oddsHost");
   if (!host) return;
   if (!o || !o.found) {
     host.innerHTML = `<div class="empty">No DraftKings props posted${o && o.name ? " for " + esc(o.name) : ""} — player lines usually go up during game week.</div>`;
@@ -1125,20 +1192,23 @@ function renderOdds(o) {
   host.innerHTML = `<div class="odds-book">DraftKings · props update through game week</div>${td}${mk || `<div class="empty">No yardage props for this player.</div>`}`;
 }
 
-async function loadOdds(p) {
-  const host = modalBody.querySelector("#oddsHost");
-  host.innerHTML = `<div class="loading">Loading odds…</div>`;
+async function loadOdds(tab) {
+  const p = tab.data;
+  const host = pmBody.querySelector("#oddsHost");
+  if (host) host.innerHTML = `<div class="loading">Loading odds…</div>`;
   try {
     const qs = new URLSearchParams({ name: p.name || "", team: p.team || "", pos: p.pos || "" });
     const r = await fetch("/api/player/odds?" + qs.toString(), { cache: "no-store" });
-    renderOdds(await r.json());
+    const o = await r.json();
+    tab.odds = o;
+    if (pmActiveKey === tab.key) renderOdds(o);
   } catch (e) {
-    host.innerHTML = `<div class="err-msg">Could not load odds (${esc(e)})</div>`;
+    if (host) host.innerHTML = `<div class="err-msg">Could not load odds (${esc(e)})</div>`;
   }
 }
 
 function renderAvail(data) {
-  const host = modalBody.querySelector("#availHost");
+  const host = pmBody.querySelector("#availHost");
   if (!host) return;
   const rows = (data && data.leagues) || [];
   if (!rows.length) { host.innerHTML = ""; return; }
@@ -1155,37 +1225,59 @@ function renderAvail(data) {
       </div>`).join("");
 }
 
-async function loadAvailability(p) {
-  const host = modalBody.querySelector("#availHost");
+async function loadAvailability(tab) {
+  const p = tab.data;
   try {
     const qs = new URLSearchParams({ sleeper_id: p.sleeper_id || "", espn_id: p.espn_id || "", name: p.name || "", team: p.team || "" });
     const r = await fetch("/api/player/availability?" + qs.toString(), { cache: "no-store" });
     const data = await r.json();
-    if (curPlayer === p) renderAvail(data);
+    tab.avail = data;
+    if (pmActiveKey === tab.key) renderAvail(data);
   } catch (e) {
+    const host = pmBody.querySelector("#availHost");
     if (host) host.innerHTML = "";
   }
 }
 
-async function openPlayer(d) {
-  modalCard.classList.remove("full");
-  modalCard.classList.add("wide");
-  modalTitle.textContent = d.name || "Player";
-  modalBody.innerHTML = `<div class="loading">Loading ${esc(d.name || "")}…</div>`;
-  modal.hidden = false;
-  const qs = new URLSearchParams({
-    espn_id: d.espn || "", sleeper_id: d.sleeper || "",
-    team: d.team || "", pos: d.pos || "", name: d.name || "",
-  });
-  try {
-    const r = await fetch("/api/player?" + qs.toString(), { cache: "no-store" });
-    const p = await r.json();
-    if (p.error) { modalBody.innerHTML = `<div class="err-msg">${esc(p.error)}</div>`; return; }
-    renderPlayer(p);
-  } catch (e) {
-    modalBody.innerHTML = `<div class="err-msg">Could not load player (${esc(e)})</div>`;
-  }
-}
+/* profile window chrome: tab clicks, close, search */
+pmTabsEl.addEventListener("click", e => {
+  const x = e.target.closest(".pm-tab-x");
+  if (x) { e.stopPropagation(); closePmTab(x.dataset.close); return; }
+  const t = e.target.closest(".pm-tab");
+  if (t) { pmActiveKey = t.dataset.key; renderPmTabs(); renderPmBody(); }
+});
+document.getElementById("pmClose").addEventListener("click", closePmWindow);
+pmodal.addEventListener("click", e => { if (e.target === pmodal) closePmWindow(); });
+
+const pmSearch = document.getElementById("pmSearch");
+const pmResults = document.getElementById("pmResults");
+let pmSearchTimer = null;
+pmSearch.addEventListener("input", () => {
+  clearTimeout(pmSearchTimer);
+  const q = pmSearch.value.trim();
+  if (q.length < 2) { pmResults.hidden = true; pmResults.innerHTML = ""; return; }
+  pmSearchTimer = setTimeout(async () => {
+    try {
+      const r = await fetch("/api/search?q=" + encodeURIComponent(q), { cache: "no-store" });
+      const data = await r.json();
+      const rows = data.results || [];
+      pmResults.innerHTML = rows.length
+        ? rows.map(p => `<div class="pm-result" data-espn="${esc(p.espn_id)}" data-sleeper="${esc(p.sleeper_id)}" data-team="${esc(p.team)}" data-pos="${esc(p.pos)}" data-name="${esc(p.name)}">
+             ${posBadge(p.pos)} <span class="pmr-name">${esc(p.name)}</span> <small>${esc(p.team)}</small></div>`).join("")
+        : `<div class="pm-result empty">No players found</div>`;
+      pmResults.hidden = false;
+    } catch (e) { pmResults.hidden = true; }
+  }, 200);
+});
+pmResults.addEventListener("click", e => {
+  const row = e.target.closest(".pm-result");
+  if (!row || !row.dataset.name) return;
+  openPlayer(row.dataset);
+  pmSearch.value = ""; pmResults.hidden = true; pmResults.innerHTML = "";
+});
+document.addEventListener("click", e => {
+  if (!e.target.closest(".pm-search")) pmResults.hidden = true;
+});
 
 grid.addEventListener("click", e => {
   const pg = e.target.closest(".pgbtn");
@@ -1228,6 +1320,8 @@ themeBtn.addEventListener("click", () => {
 });
 updateThemeBtn();
 document.body.addEventListener("click", e => {
+  const pm = e.target.closest(".pm-open");
+  if (pm) { e.preventDefault(); e.stopPropagation(); openPlayer(pm.dataset); return; }
   const row = e.target.closest(".prow.clickable, .rcell.clickable");
   if (row) openPlayer(row.dataset);
 });

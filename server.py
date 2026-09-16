@@ -186,6 +186,29 @@ def build_player(params):
     return fantasy.player_profile(espn_id, sleeper_id, team, pos, name, season)
 
 
+def build_search(params):
+    q = (params.get("q") or [""])[0].strip().lower()
+    if len(q) < 2:
+        return {"results": []}
+    players = fantasy.sleeper_players()
+    res = []
+    for pid, meta in players.items():
+        fn = meta.get("full_name")
+        pos = meta.get("position")
+        if not fn or pos not in ("QB", "RB", "WR", "TE", "K", "DEF"):
+            continue
+        if q in fn.lower():
+            rank = meta.get("search_rank")
+            rank = rank if isinstance(rank, int) else 9_999_999
+            res.append((rank, {
+                "sleeper_id": pid,
+                "espn_id": str(meta["espn_id"]) if meta.get("espn_id") else "",
+                "name": fn, "team": meta.get("team") or "", "pos": pos,
+            }))
+    res.sort(key=lambda x: x[0])
+    return {"results": [r for _, r in res[:12]]}
+
+
 def build_availability(params):
     cfg = load_config() or {}
     espn_id = (params.get("espn_id") or [""])[0] or None
@@ -352,6 +375,13 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(parts.query)
             try:
                 self._send(200, build_league_lab((q.get("id") or [""])[0]))
+            except Exception as e:
+                traceback.print_exc()
+                self._send(500, {"error": str(e)})
+            return
+        if path == "/api/search":
+            try:
+                self._send(200, build_search(parse_qs(parts.query)))
             except Exception as e:
                 traceback.print_exc()
                 self._send(500, {"error": str(e)})

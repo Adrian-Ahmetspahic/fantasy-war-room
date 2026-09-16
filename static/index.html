@@ -49,6 +49,20 @@
     </div>
   </div>
 
+  <div id="pmodal" class="modal" hidden>
+    <div class="modal-card wide pm-card">
+      <div class="pm-bar">
+        <div class="pm-tabs" id="pmTabs"></div>
+        <div class="pm-search">
+          <input id="pmSearch" type="text" placeholder="🔍 Search players…" autocomplete="off">
+          <div id="pmResults" class="pm-results" hidden></div>
+        </div>
+        <button id="pmClose" class="modal-close" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body pm-body" id="pmBody"></div>
+    </div>
+  </div>
+
   <script src="/static/app.js"></script>
 </body>
 </html>
