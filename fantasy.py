@@ -151,7 +151,7 @@ def nfl_game_status(force=False):
     status is one of: 'pre' (yet to play), 'in' (live), 'post' (final).
     """
     now = time.time()
-    if not force and now - _nfl_cache["ts"] < 15 and _nfl_cache["data"]:
+    if not force and _nfl_cache["ts"] and now - _nfl_cache["ts"] < 15:
         return _nfl_cache["data"]
 
     out = {}
@@ -251,6 +251,158 @@ def _sleeper_projections(season, week, scoring):
 POS_SLEEPER = {"QB", "RB", "WR", "TE", "K", "DEF"}
 
 
+# ---- live current-week box-score stat lines -------------------------------
+_WSTATS = {"ts": 0, "data": {}}
+_E2S = {"ts": 0, "map": {}}
+
+
+def _cur_week_stats():
+    """Bulk current-week box stats for every player, keyed by Sleeper id.
+    Cached ~20s; updates live during games."""
+    now = time.time()
+    if _WSTATS["ts"] and now - _WSTATS["ts"] < 20:   # cache even an empty week
+        return _WSTATS["data"]
+    data = _WSTATS.get("data") or {}
+    try:
+        st = sleeper_state()
+        season = st.get("season")
+        wk = st.get("display_week") or st.get("week") or 1
+        rows = _get_json(f"https://api.sleeper.com/stats/nfl/{season}/{wk}"
+                         f"?season_type=regular", timeout=20)
+        data = {str(r.get("player_id")): (r.get("stats") or {})
+                for r in rows if r.get("player_id")}
+    except Exception as e:
+        print(f"[stats] week stats failed: {e}")
+    _WSTATS["ts"], _WSTATS["data"] = now, data
+    return data
+
+
+def _espn_to_sleeper_map():
+    now = time.time()
+    if now - _E2S["ts"] < 3600 and _E2S["map"]:
+        return _E2S["map"]
+    m = {}
+    try:
+        for pid, meta in sleeper_players().items():
+            eid = meta.get("espn_id")
+            if eid:
+                m[str(eid)] = str(pid)
+    except Exception as e:
+        print(f"[stats] espn->sleeper map failed: {e}")
+    _E2S["ts"], _E2S["map"] = now, m
+    return m
+
+
+def _num(v):
+    if v is None:
+        return 0
+    try:
+        f = float(v)
+        return int(f) if f == int(f) else round(f, 1)
+    except (TypeError, ValueError):
+        return v
+
+
+def _statline(pos, s):
+    """Compact current-game box line for a player, or None."""
+    if not s:
+        return None
+    pos = (pos or "").upper()
+    P = []
+
+    def i(k):
+        return _num(s.get(k) or 0)
+
+    if pos == "QB":
+        if s.get("pass_att"):
+            P.append(f"{i('pass_cmp')}/{i('pass_att')} {i('pass_yd')} yd")
+        if s.get("pass_td"):
+            P.append(f"{i('pass_td')} TD")
+        if s.get("pass_int"):
+            P.append(f"{i('pass_int')} INT")
+        if s.get("rush_yd") or s.get("rush_td"):
+            P.append(f"{i('rush_att')}-{i('rush_yd')} rush"
+                     + (f", {i('rush_td')} TD" if s.get("rush_td") else ""))
+    elif pos == "RB":
+        if s.get("rush_att") or s.get("rush_yd"):
+            P.append(f"{i('rush_att')} car {i('rush_yd')} yd"
+                     + (f", {i('rush_td')} TD" if s.get("rush_td") else ""))
+        if s.get("rec") or s.get("rec_tgt"):
+            P.append(f"{i('rec')}/{i('rec_tgt')} {i('rec_yd')} yd"
+                     + (f", {i('rec_td')} TD" if s.get("rec_td") else ""))
+    elif pos in ("WR", "TE"):
+        P.append(f"{i('rec')}/{i('rec_tgt')} {i('rec_yd')} yd"
+                 + (f", {i('rec_td')} TD" if s.get("rec_td") else ""))
+        if s.get("rush_yd") or s.get("rush_td"):
+            P.append(f"{i('rush_att')}-{i('rush_yd')} rush"
+                     + (f", {i('rush_td')} TD" if s.get("rush_td") else ""))
+    elif pos == "K":
+        if s.get("fga") is not None or s.get("xpa") is not None:
+            P.append(f"{i('fgm')}/{i('fga')} FG, {i('xpm')}/{i('xpa')} XP")
+    elif pos in ("DEF", "D/ST"):
+        if s.get("sack"):
+            P.append(f"{i('sack')} sk")
+        if s.get("int"):
+            P.append(f"{i('int')} INT")
+        fr = s.get("def_st_fum_rec") or s.get("fum_rec")
+        if fr:
+            P.append(f"{_num(fr)} FR")
+        if s.get("def_td") or s.get("def_st_td"):
+            P.append(f"{i('def_td')} TD")
+        if s.get("pts_allow") is not None:
+            P.append(f"{i('pts_allow')} PA")
+    return " · ".join(P) or None
+
+
+_SNAME = {"ts": 0, "nt": {}, "nm": {}}
+
+
+def _sleeper_name_index():
+    """name+team (and unambiguous name-only) -> Sleeper id, for resolving ESPN
+    players that Sleeper has no espn_id for."""
+    now = time.time()
+    if now - _SNAME["ts"] < 3600 and _SNAME["nt"]:
+        return _SNAME
+    nt, nm, dup = {}, {}, set()
+    try:
+        for pid, meta in sleeper_players().items():
+            if meta.get("position") == "DEF":
+                continue
+            n = _norm_name(meta.get("full_name") or "")
+            if not n:
+                continue
+            nt[n + "|" + canon_team(meta.get("team"))] = pid
+            if n in nm and nm[n] != pid:
+                dup.add(n)
+            else:
+                nm[n] = pid
+        for n in dup:
+            nm.pop(n, None)
+    except Exception as e:
+        print(f"[stats] name index failed: {e}")
+    _SNAME.update(ts=now, nt=nt, nm=nm)
+    return _SNAME
+
+
+def _sl_statline(pid, pos):
+    if not pid or str(pid) in ("0", ""):
+        return None
+    return _statline(pos, _cur_week_stats().get(str(pid)))
+
+
+def _espn_statline(espn_id, name, team, pos):
+    pos_n = "DEF" if pos == "D/ST" else pos
+    if pos_n == "DEF":                     # Sleeper keys team defenses by abbrev
+        sid = canon_team(team)
+    else:
+        sid = _espn_to_sleeper_map().get(str(espn_id)) if espn_id else None
+        if not sid and name:               # espn_id missing in Sleeper -> match by name
+            idx = _sleeper_name_index()
+            sid = (idx["nt"].get(_norm_name(name) + "|" + canon_team(team))
+                   or idx["nm"].get(_norm_name(name)))
+    return _statline(pos_n, _cur_week_stats().get(sid)) if sid else None
+
+
 def _record_str(w, l, t):
     w, l, t = int(w or 0), int(l or 0), int(t or 0)
     return f"{w}-{l}-{t}" if t else f"{w}-{l}"
@@ -287,6 +439,7 @@ def _sl_player(pid, players, pts, projections, nfl, starter):
         "opp": g.get("opp"),
         "opp_ha": g.get("ha"),
         "injury": _injury_code(meta.get("injury_status")),
+        "statline": _sl_statline(pid, pos),
         "starter": starter,
         "sleeper_id": str(pid) if str(pid) not in ("0", "") and pid is not None else None,
         "espn_id": str(espn_id) if espn_id else None,
@@ -558,6 +711,7 @@ def _espn_build_team(t, week, nfl):
             "opp": g.get("opp"),
             "opp_ha": g.get("ha"),
             "injury": _injury_code(p.get("injuryStatus")),
+            "statline": _espn_statline(p.get("id"), p.get("fullName"), team, pos),
             "starter": not is_bench,
             "espn_id": str(p.get("id")) if p.get("id") else None,
             "sleeper_id": None,
@@ -1346,6 +1500,86 @@ def player_odds(name, team=None, pos=None):
             })
     return {"found": True, "book": "DraftKings", "name": e.get("name"),
             "td": e.get("td"), "markets": markets}
+
+
+# --------------------------------------------------------------------------
+# Per-league availability: who rosters a player (or is he a free agent)
+# --------------------------------------------------------------------------
+_OWN_CACHE = {}
+
+
+def _name_team_key(name, team):
+    return _norm_name(name or "") + "|" + canon_team(team)
+
+
+def resolve_sleeper_id(espn_id=None, name=None, team=None):
+    """ESPN->Sleeper id via Sleeper's espn_id field, falling back to name+team
+    (Sleeper's espn_id is missing for many newer players)."""
+    if espn_id:
+        sid = _espn_to_sleeper_map().get(str(espn_id))
+        if sid:
+            return sid
+    if name:
+        idx = _sleeper_name_index()
+        return (idx["nt"].get(_name_team_key(name, team))
+                or idx["nm"].get(_norm_name(name)))
+    return None
+
+
+def sleeper_ownership(league_id, my_user_id=None):
+    key = ("sl", str(league_id))
+    hit = _OWN_CACHE.get(key)
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    players = sleeper_players()
+    league = _get_json(f"{SLEEPER}/league/{league_id}")
+    rosters = _get_json(f"{SLEEPER}/league/{league_id}/rosters")
+    users = _get_json(f"{SLEEPER}/league/{league_id}/users")
+    uname = {}
+    for u in users:
+        uname[u["user_id"]] = ((u.get("metadata") or {}).get("team_name")
+                               or u.get("display_name"))
+    owners, by_name = {}, {}
+    for r in rosters:
+        oid = r.get("owner_id")
+        info = {"team": uname.get(oid, "Team"),
+                "is_me": my_user_id is not None and oid == my_user_id}
+        for pid in (r.get("players") or []):
+            owners[str(pid)] = info
+            meta = players.get(str(pid))
+            if meta and meta.get("full_name"):
+                by_name[_name_team_key(meta["full_name"], meta.get("team"))] = info
+    res = {"league_name": league.get("name", "Sleeper league"),
+           "owners": owners, "by_name": by_name}
+    _OWN_CACHE[key] = (time.time(), res)
+    return res
+
+
+def espn_ownership(league_id, espn_s2, swid, season, week):
+    key = ("espn", str(league_id))
+    hit = _OWN_CACHE.get(key)
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    league = _espn_fetch(league_id, espn_s2, swid, season, week)
+    my_id = _espn_my_team_id(league, swid)
+    owners, by_name = {}, {}
+    for t in league.get("teams", []):
+        name = (t.get("name")
+                or f"{t.get('location', '')} {t.get('nickname', '')}".strip()
+                or "Team")
+        info = {"team": name, "is_me": t.get("id") == my_id}
+        for e in (t.get("roster") or {}).get("entries", []):
+            p = (e.get("playerPoolEntry") or {}).get("player") or {}
+            pid = p.get("id")
+            if pid is not None:
+                owners[str(pid)] = info
+            if p.get("fullName"):
+                tm = canon_team(ESPN_PRO_TEAM.get(p.get("proTeamId"), ""))
+                by_name[_name_team_key(p["fullName"], tm)] = info
+    res = {"league_name": (league.get("settings") or {}).get("name", "ESPN league"),
+           "owners": owners, "by_name": by_name}
+    _OWN_CACHE[key] = (time.time(), res)
+    return res
 
 
 def player_profile(espn_id, sleeper_id, team, pos, name, season):

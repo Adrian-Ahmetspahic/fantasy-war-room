@@ -181,9 +181,73 @@ def build_player(params):
     if sleeper_id and not espn_id:
         espn_id = (players.get(str(sleeper_id)) or {}).get("espn_id")
         espn_id = str(espn_id) if espn_id else None
-    if espn_id and not sleeper_id:
-        sleeper_id = _espn_sleeper_index(players).get(str(espn_id))
+    if not sleeper_id:
+        sleeper_id = fantasy.resolve_sleeper_id(espn_id, name, team)
     return fantasy.player_profile(espn_id, sleeper_id, team, pos, name, season)
+
+
+def build_availability(params):
+    cfg = load_config() or {}
+    espn_id = (params.get("espn_id") or [""])[0] or None
+    sleeper_id = (params.get("sleeper_id") or [""])[0] or None
+    name = (params.get("name") or [""])[0] or None
+    team = (params.get("team") or [""])[0] or None
+    players = fantasy.sleeper_players()
+    if sleeper_id and not espn_id:
+        espn_id = (players.get(str(sleeper_id)) or {}).get("espn_id")
+        espn_id = str(espn_id) if espn_id else None
+    if not sleeper_id:
+        sleeper_id = fantasy.resolve_sleeper_id(espn_id, name, team)
+    nk = fantasy._name_team_key(name, team) if name else None
+
+    state = fantasy.sleeper_state()
+    season = str(cfg.get("season") or state.get("season"))
+    week = int(cfg.get("week") or state.get("display_week") or state.get("week") or 1)
+    out = []
+
+    sl = cfg.get("sleeper") or {}
+    my_uid = sl.get("user_id")
+    if not my_uid and sl.get("username"):
+        try:
+            my_uid = fantasy.sleeper_user_id(sl["username"])
+        except Exception:
+            my_uid = None
+    sleeper_lids = sl.get("league_ids") or []
+    if not sleeper_lids and my_uid:
+        try:
+            sleeper_lids = [l["league_id"]
+                            for l in fantasy.sleeper_discover_leagues(my_uid, season)]
+        except Exception as e:
+            print(f"[avail] discovery failed: {e}")
+    for lid in sleeper_lids:
+        try:
+            own = fantasy.sleeper_ownership(lid, my_uid)
+            e = (own["owners"].get(str(sleeper_id)) if sleeper_id else None) \
+                or (own.get("by_name", {}).get(nk) if nk else None)
+            out.append({"league": own["league_name"], "provider": "sleeper",
+                        "status": "owned" if e else "available",
+                        "team": e["team"] if e else None,
+                        "is_me": bool(e and e["is_me"])})
+        except Exception as ex:
+            print(f"[avail] sleeper {lid}: {ex}")
+
+    for lg in cfg.get("espn") or []:
+        lid, s2 = lg.get("league_id"), lg.get("espn_s2")
+        swid = lg.get("swid") or lg.get("SWID")
+        if not (lid and s2 and swid):
+            continue
+        try:
+            own = fantasy.espn_ownership(lid, s2, swid, season, week)
+            e = (own["owners"].get(str(espn_id)) if espn_id else None) \
+                or (own.get("by_name", {}).get(nk) if nk else None)
+            out.append({"league": own["league_name"], "provider": "espn",
+                        "status": "owned" if e else "available",
+                        "team": e["team"] if e else None,
+                        "is_me": bool(e and e["is_me"])})
+        except Exception as ex:
+            print(f"[avail] espn {lid}: {ex}")
+
+    return {"leagues": out}
 
 
 def build_gamelog(params):
@@ -288,6 +352,13 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(parts.query)
             try:
                 self._send(200, build_league_lab((q.get("id") or [""])[0]))
+            except Exception as e:
+                traceback.print_exc()
+                self._send(500, {"error": str(e)})
+            return
+        if path == "/api/player/availability":
+            try:
+                self._send(200, build_availability(parse_qs(parts.query)))
             except Exception as e:
                 traceback.print_exc()
                 self._send(500, {"error": str(e)})

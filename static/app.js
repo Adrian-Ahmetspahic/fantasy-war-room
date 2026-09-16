@@ -77,6 +77,7 @@ function playerRow(p) {
       <span class="pmeta">
         <div class="pname">${esc(p.name)}${injBadge(p)}</div>
         <div class="psub">${teamLogo(p.team)}${esc(p.team || "FA")}${oppStr(p)}${rz}${detail}${p.value != null ? ` · <span class="vtag">${posRankStr(p)} ${fmtVal(p.value)}</span>` : ""}</div>
+        ${p.statline ? `<div class="pstat">${esc(p.statline)}</div>` : ""}
       </span>
       <span class="ppts">${(p.points || 0).toFixed(1)}${proj}</span>
     </div>`;
@@ -616,7 +617,7 @@ async function openTrade(id, name) {
     let bIdx = teams.findIndex((t, i) => i !== aIdx); if (bIdx < 0) bIdx = 0;
     const block = new Set(store.get("block:" + id, []));
     T = { teams, aIdx, bIdx, leagueId: id, selA: new Set(), selB: new Set(),
-      fairness: 0.12, needOnly: false, startersOnly: false, want: new Set(), block };
+      fairness: 0.12, needOnly: false, startersOnly: false, want: new Set(), exclude: new Set(), block };
     renderTrade();
   } catch (e) {
     modalBody.innerHTML = `<div class="err-msg">Could not load trade (${esc(e)})</div>`;
@@ -671,6 +672,10 @@ function renderTrade() {
           <span class="want-lbl">I want to acquire:</span>
           ${NEED_POS.map(p => `<button class="want-pill ${posClass(p)} ${T.want.has(p) ? "on" : ""}" data-pos="${p}">${p}</button>`).join("")}
         </div>
+        <div class="want-row">
+          <span class="want-lbl">Exclude from trade:</span>
+          ${NEED_POS.map(p => `<button class="excl-pill ${T.exclude.has(p) ? "on" : ""}" data-pos="${p}">${p}</button>`).join("")}
+        </div>
         <div id="needChips"></div>
         <div id="findOut"></div>
       </div>
@@ -708,6 +713,14 @@ function renderTrade() {
     pill.classList.toggle("on", T.want.has(p));
     if (modalBody.querySelector("#findOut").children.length) renderSwaps();
   }));
+  modalBody.querySelectorAll(".excl-pill").forEach(pill => pill.addEventListener("click", () => {
+    const p = pill.dataset.pos;
+    if (T.exclude.has(p)) T.exclude.delete(p); else T.exclude.add(p);
+    pill.classList.toggle("on", T.exclude.has(p));
+    const out = modalBody.querySelector("#findOut");
+    if (out.querySelector(".block-swap")) renderBlockTrades();
+    else if (out.children.length) renderSwaps();
+  }));
   modalBody.querySelector("#findBtn").addEventListener("click", renderSwaps);
   modalBody.querySelector("#blockBtn").addEventListener("click", renderBlockTrades);
   modalBody.querySelectorAll(".tl-block").forEach(star => star.addEventListener("click", e => {
@@ -742,6 +755,7 @@ function renderBlockTrades() {
     const consider = (give, get) => {
       const g = sumVal(give), h = sumVal(get), diff = Math.abs(g - h), den = Math.max(g, h) || 1;
       if (diff / den > band) return;
+      if (T.exclude.size && give.concat(get).some(p => T.exclude.has(p.pos))) return;
       if (T.want.size) {
         const gp = new Set(get.map(p => p.pos));
         let ok = false; T.want.forEach(p => { if (gp.has(p)) ok = true; });
@@ -848,6 +862,7 @@ function renderSwaps() {
   const consider = (give, get) => {
     const g = sumVal(give), h = sumVal(get), diff = Math.abs(g - h), den = Math.max(g, h) || 1;
     if (diff / den > band) return;
+    if (T.exclude.size && give.concat(get).some(p => T.exclude.has(p.pos))) return;
     // target positions: the incoming players must include a wanted position
     if (T.want.size) {
       const getPos = new Set(get.map(p => p.pos));
@@ -1059,8 +1074,11 @@ function renderPlayer(p) {
       <div id="oddsHost"><div class="loading">Loading odds…</div></div>
     </div>`;
 
+  const availBlock = `<div id="availHost" class="avail"><div class="avail-loading">Checking your leagues…</div></div>`;
+
   modalTitle.textContent = p.name;
-  modalBody.innerHTML = head + tabs + logPanel + newsPanel + depthPanel + oddsPanel;
+  modalBody.innerHTML = head + availBlock + tabs + logPanel + newsPanel + depthPanel + oddsPanel;
+  loadAvailability(p);
 
   modalBody.querySelectorAll(".ptab").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -1116,6 +1134,36 @@ async function loadOdds(p) {
     renderOdds(await r.json());
   } catch (e) {
     host.innerHTML = `<div class="err-msg">Could not load odds (${esc(e)})</div>`;
+  }
+}
+
+function renderAvail(data) {
+  const host = modalBody.querySelector("#availHost");
+  if (!host) return;
+  const rows = (data && data.leagues) || [];
+  if (!rows.length) { host.innerHTML = ""; return; }
+  const chip = r => {
+    if (r.status !== "owned")
+      return `<span class="av-chip av-free">Available · FA/waivers</span>`;
+    if (r.is_me) return `<span class="av-chip av-mine">YOU</span>`;
+    return `<span class="av-chip av-owned">${esc(r.team || "Rostered")}</span>`;
+  };
+  host.innerHTML = `<div class="avail-title">Availability in your leagues</div>`
+    + rows.map(r => `<div class="av-row">
+        <span class="av-league"><span class="prov ${r.provider}">${r.provider}</span> ${esc(r.league)}</span>
+        ${chip(r)}
+      </div>`).join("");
+}
+
+async function loadAvailability(p) {
+  const host = modalBody.querySelector("#availHost");
+  try {
+    const qs = new URLSearchParams({ sleeper_id: p.sleeper_id || "", espn_id: p.espn_id || "", name: p.name || "", team: p.team || "" });
+    const r = await fetch("/api/player/availability?" + qs.toString(), { cache: "no-store" });
+    const data = await r.json();
+    if (curPlayer === p) renderAvail(data);
+  } catch (e) {
+    if (host) host.innerHTML = "";
   }
 }
 
