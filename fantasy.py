@@ -460,7 +460,13 @@ def _sl_starting_slots(league):
             if p not in ("BN", "IR", "TAXI")]
 
 
-def _sl_build_team(m, roster, user_name, players, projections, nfl, slots=None):
+def _global_starters(matchups):
+    """All players locked into a starting lineup this week, across the league."""
+    return {str(s) for mm in matchups for s in (mm.get("starters") or [])}
+
+
+def _sl_build_team(m, roster, user_name, players, projections, nfl, slots=None,
+                   locked_elsewhere=None):
     """Build a full team (starters + bench + record) from a matchup entry."""
     if m is None:
         return None
@@ -468,8 +474,14 @@ def _sl_build_team(m, roster, user_name, players, projections, nfl, slots=None):
     settings = (roster or {}).get("settings", {})
     starters = m.get("starters") or []
     starter_set = {str(s) for s in starters}
-    all_players = m.get("players") or []
+    # Roster membership comes from /rosters (reflects trades immediately);
+    # the /matchups list is a locked week snapshot and lags after a trade.
+    all_players = (roster or {}).get("players") or m.get("players") or []
     pts = m.get("players_points") or {}
+    # Exclude players who are locked as a starter elsewhere this week (a
+    # mid-week trade keeps them scoring for their old team's lineup), so a
+    # traded player shows once -- on the team currently starting them.
+    bench_excl = starter_set | (locked_elsewhere or set())
 
     starter_out = [_sl_player(pid, players, pts, projections, nfl, True)
                    for pid in starters]
@@ -477,7 +489,7 @@ def _sl_build_team(m, roster, user_name, players, projections, nfl, slots=None):
     for i, row in enumerate(starter_out):
         row["slot"] = slots[i] if i < len(slots) else row["pos"]
     bench_out = [_sl_player(pid, players, pts, projections, nfl, False)
-                 for pid in all_players if str(pid) not in starter_set]
+                 for pid in all_players if str(pid) not in bench_excl]
     bench_out.sort(key=lambda p: (_POS_ORDER.get(p["pos"], 9), -(p["points"] or 0)))
 
     score = round(float(m.get("points") or 0), 2)
@@ -530,10 +542,11 @@ def sleeper_league_payload(league_id, my_user_id, week, players, nfl, override=N
 
     # build every team, enrich, and pair into matchups
     fc = _fc_for(len(rosters), _sleeper_val_params(league, override))
+    gstart = _global_starters(matchups)
     by_mid, meta_by_roster = {}, {}
     for m in matchups:
         r = roster_by_id.get(m["roster_id"])
-        t = _sl_build_team(m, r, user_name, players, projections, nfl, slots)
+        t = _sl_build_team(m, r, user_name, players, projections, nfl, slots, gstart)
         if not t:
             continue
         _fc_enrich_team(t, fc)
@@ -578,12 +591,13 @@ def sleeper_all_rosters(league_id, week, players, nfl, my_user_id=None, override
         league_id, week)
     by_roster = {m["roster_id"]: m for m in matchups}
     fc = _fc_for(len(rosters), _sleeper_val_params(league, override))
+    gstart = _global_starters(matchups)
     teams = []
     for r in rosters:
         m = by_roster.get(r["roster_id"])
         if m is None:
             continue
-        t = _sl_build_team(m, r, user_name, players, projections, nfl, slots)
+        t = _sl_build_team(m, r, user_name, players, projections, nfl, slots, gstart)
         t["is_me"] = my_user_id is not None and r.get("owner_id") == my_user_id
         _fc_enrich_team(t, fc)
         teams.append(t)
@@ -1963,12 +1977,13 @@ def league_lab_sleeper(league_id, my_user_id, week, players, nfl, override=None)
     fc = _fc_for(len(rosters), _sleeper_val_params(league, override))
     dk = dk_props()
     by_roster = {m["roster_id"]: m for m in matchups}
+    gstart = _global_starters(matchups)
     teams = []
     for r in rosters:
         m = by_roster.get(r["roster_id"])
         if not m:
             continue
-        t = _sl_build_team(m, r, user_name, players, projections, nfl, slots)
+        t = _sl_build_team(m, r, user_name, players, projections, nfl, slots, gstart)
         st = r.get("settings", {})
         t["id"] = r["roster_id"]
         t["is_me"] = r.get("owner_id") == my_user_id

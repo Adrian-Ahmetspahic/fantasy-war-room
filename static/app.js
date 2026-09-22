@@ -1116,9 +1116,14 @@ function closePmWindow() {
 function renderPlayerInto(tab) {
   const p = tab.data;
   const panel = tab.panel || "log";
-  const gl = p.gamelog || {};
-  const seasonSel = (p.seasons && p.seasons.length)
-    ? `<select id="glseason">${p.seasons.map(s => `<option ${String(s) === String(gl.season) ? "selected" : ""}>${esc(s)}</option>`).join("")}</select>`
+  const gl0 = p.gamelog || {};
+  if (!tab.glCache) { tab.glCache = {}; if (gl0.season) tab.glCache[String(gl0.season)] = gl0; }
+  if (!tab.season && gl0.season) tab.season = String(gl0.season);
+  const seasons = p.seasons || gl0.seasons || [];
+  const curSeason = tab.season || gl0.season;
+  const curGl = tab.glCache[String(curSeason)] || gl0;
+  const seasonSel = seasons.length
+    ? `<select id="glseason">${seasons.map(s => `<option ${String(s) === String(curSeason) ? "selected" : ""}>${esc(s)}</option>`).join("")}</select>`
     : "";
   const head = `<div class="pp-head">
       ${p.headshot ? `<img class="pp-shot" src="${esc(p.headshot)}" alt="" onerror="this.style.display='none'">` : ""}
@@ -1131,7 +1136,7 @@ function renderPlayerInto(tab) {
   const tabsBar = `<div class="ptabs">${pane("log", "Game Log")}${pane("news", "News &amp; Outlook")}${pane("depth", "Depth Chart")}${pane("odds", "Vegas")}</div>`;
   const logPanel = `<div class="ppanel" data-panel="log" ${panel === "log" ? "" : "hidden"}>
       <div class="panel-bar">Season ${seasonSel}</div>
-      <div id="glhost">${gamelogTable(gl)}</div>
+      <div id="glhost">${gamelogTable(curGl)}</div>
     </div>`;
   const newsPanel = `<div class="ppanel" data-panel="news" ${panel === "news" ? "" : "hidden"}>
       <div class="sec-label espn">ESPN</div>${newsList(p.news.espn)}
@@ -1167,12 +1172,17 @@ function renderPlayerInto(tab) {
   });
   const sel = pmBody.querySelector("#glseason");
   if (sel) sel.addEventListener("change", async () => {
+    const yr = sel.value;
+    tab.season = yr;                                   // remember selection per tab
     const host = pmBody.querySelector("#glhost");
-    host.innerHTML = `<div class="loading">Loading ${sel.value}…</div>`;
+    if (tab.glCache[yr]) { host.innerHTML = gamelogTable(tab.glCache[yr]); return; }
+    host.innerHTML = `<div class="loading">Loading ${yr}…</div>`;
     try {
-      const r = await fetch(`/api/player/gamelog?espn_id=${encodeURIComponent(p.espn_id || "")}&sleeper_id=${encodeURIComponent(p.sleeper_id || "")}&season=${sel.value}`, { cache: "no-store" });
-      host.innerHTML = gamelogTable(await r.json());
-    } catch (e) { host.innerHTML = `<div class="err-msg">Could not load ${sel.value}</div>`; }
+      const r = await fetch(`/api/player/gamelog?espn_id=${encodeURIComponent(p.espn_id || "")}&sleeper_id=${encodeURIComponent(p.sleeper_id || "")}&season=${yr}`, { cache: "no-store" });
+      const data = await r.json();
+      tab.glCache[yr] = data;                          // cache so switching back is instant
+      if (pmActiveKey === tab.key && tab.season === yr) host.innerHTML = gamelogTable(data);
+    } catch (e) { host.innerHTML = `<div class="err-msg">Could not load ${yr}</div>`; }
   });
 }
 
