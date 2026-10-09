@@ -12,22 +12,33 @@ back to either service -- this only reads scores.
 import json
 import os
 import sys
+import tempfile
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import ai_trade
 import fantasy
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(HERE, "config.json")
 PORT = int(os.environ.get("PORT", "8787"))
 
 
 def load_config():
-    path = os.path.join(HERE, "config.json")
-    if not os.path.exists(path):
+    if not os.path.exists(CONFIG_PATH):
         return None
-    with open(path) as f:
+    with open(CONFIG_PATH) as f:
         return json.load(f)
+
+
+def save_config(cfg):
+    """Atomically rewrite config.json (keeps every other key as-is)."""
+    fd, tmp = tempfile.mkstemp(dir=HERE, prefix=".config.", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, CONFIG_PATH)
 
 
 def _override_for(cfg, league_id):
@@ -288,6 +299,69 @@ def build_gamelog(params):
     return fantasy.player_gamelog(espn_id, sleeper_id, season)
 
 
+def build_league_trades(full_id):
+    cfg = load_config()
+    if cfg is None or ":" not in full_id:
+        return {"error": "bad league id"}
+    provider, league_id = full_id.split(":", 1)
+    state = fantasy.sleeper_state()
+    season = str(cfg.get("season") or state.get("season"))
+    week = int(cfg.get("week") or state.get("display_week") or state.get("week") or 1)
+    if provider == "sleeper":
+        return {"trades": fantasy.league_trades_sleeper(league_id, week, fantasy.sleeper_players())}
+    if provider == "espn":
+        for lg in cfg.get("espn") or []:
+            if str(lg.get("league_id")) == str(league_id):
+                return {"trades": fantasy.league_trades_espn(
+                    league_id, lg.get("espn_s2"), lg.get("swid") or lg.get("SWID"), season)}
+        return {"error": "league not found in config"}
+    return {"error": "unknown provider"}
+
+
+def ai_settings_public():
+    return ai_trade.public_status(ai_trade.settings_from(load_config() or {}))
+
+
+def save_ai_settings(body):
+    cfg = load_config()
+    if cfg is None:
+        return {"error": "config.json not found."}
+    ai = dict(cfg.get("ai") or {})
+    provider = body.get("provider")
+    if provider in ai_trade.PROVIDERS:
+        ai["provider"] = provider
+    if body.get("clear"):
+        ai.pop("api_key", None)
+    elif body.get("api_key"):
+        ai["api_key"] = str(body["api_key"]).strip()   # stored only in git-ignored config.json
+    if "model" in body:
+        ai["model"] = str(body.get("model") or "").strip()
+    if "base_url" in body:
+        ai["base_url"] = str(body.get("base_url") or "").strip()
+    cfg["ai"] = ai
+    save_config(cfg)
+    return ai_settings_public()
+
+
+def run_ai_trade(body):
+    cfg = load_config()
+    if cfg is None:
+        return {"error": "config.json not found."}
+    fid = body.get("id") or ""
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fr = ex.submit(build_rosters, fid)
+        fl = ex.submit(build_league_lab, fid)
+        rosters = fr.result()
+        try:
+            lab = fl.result()
+        except Exception as e:
+            print(f"[ai] lab unavailable: {e}")
+            lab = None
+    if rosters.get("error"):
+        return rosters
+    return ai_trade.analyze(cfg, rosters, lab if lab and not lab.get("error") else None, body)
+
+
 def build_league_lab(full_id):
     cfg = load_config()
     if cfg is None:
@@ -404,6 +478,21 @@ class Handler(BaseHTTPRequestHandler):
                 traceback.print_exc()
                 self._send(500, {"error": str(e)})
             return
+        if path == "/api/league/trades":
+            q = parse_qs(parts.query)
+            try:
+                self._send(200, build_league_trades((q.get("id") or [""])[0]))
+            except Exception as e:
+                traceback.print_exc()
+                self._send(500, {"error": str(e)})
+            return
+        if path == "/api/ai/settings":
+            try:
+                self._send(200, ai_settings_public())
+            except Exception as e:
+                traceback.print_exc()
+                self._send(500, {"error": str(e)})
+            return
         if path in ("/", "/index.html"):
             return self._serve_static("index.html", "text/html; charset=utf-8")
         if path.startswith("/static/"):
@@ -412,6 +501,34 @@ class Handler(BaseHTTPRequestHandler):
                      else "application/javascript" if name.endswith(".js")
                      else "application/octet-stream")
             return self._serve_static(name, ctype)
+        self._send(404, {"error": "not found"})
+
+    def _read_body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n else b""
+        try:
+            return json.loads(raw.decode("utf-8")) if raw else {}
+        except ValueError:
+            return None
+
+    def do_POST(self):
+        from urllib.parse import urlsplit
+        path = urlsplit(self.path).path
+        body = self._read_body()
+        if body is None:
+            return self._send(400, {"error": "invalid JSON body"})
+        if path == "/api/ai/settings":
+            try:
+                return self._send(200, save_ai_settings(body))
+            except Exception as e:
+                traceback.print_exc()
+                return self._send(500, {"error": str(e)})
+        if path == "/api/trade/ai":
+            try:
+                return self._send(200, run_ai_trade(body))
+            except Exception as e:
+                traceback.print_exc()
+                return self._send(500, {"error": str(e)})
         self._send(404, {"error": "not found"})
 
     def _serve_static(self, name, ctype):

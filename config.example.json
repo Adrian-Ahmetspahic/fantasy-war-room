@@ -24,6 +24,14 @@
     }
   ],
 
+  "_note_ai": "OPTIONAL. The AI trade analyst. Easiest: leave this out and pick 'Claude account' or 'ChatGPT account' in the app's ⚙ Settings -- that uses the Claude Code / Codex CLI already signed in on your machine (no API key). Or set a provider + api_key here (or via the ANTHROPIC_API_KEY / OPENAI_API_KEY env vars). provider: claude_cli | codex_cli | anthropic | openai | custom. The app's Settings screen writes this block for you.",
+  "ai": {
+    "provider": "claude_cli",
+    "model": "",
+    "api_key": "",
+    "base_url": ""
+  },
+
   "_note_overrides": "OPTIONAL. Trade values (FantasyCalc) auto-detect PPR, superflex, and dynasty from each league's settings. Only add an entry here to override that detection for a specific league_id. Keys: dynasty (true/false), superflex (true/false), ppr (1 = full, 0.5 = half, 0 = standard). ESPN dynasty can't be auto-detected, so set it here if your ESPN league is a dynasty/keeper.",
   "league_overrides": {
     "111111": { "dynasty": true, "superflex": true, "ppr": 0.5 }

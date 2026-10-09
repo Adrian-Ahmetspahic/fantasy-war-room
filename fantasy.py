@@ -271,10 +271,35 @@ def _cur_week_stats():
                          f"?season_type=regular", timeout=20)
         data = {str(r.get("player_id")): (r.get("stats") or {})
                 for r in rows if r.get("player_id")}
+        _WSTATS["wk"] = int(wk)
     except Exception as e:
         print(f"[stats] week stats failed: {e}")
     _WSTATS["ts"], _WSTATS["data"] = now, data
     return data
+
+
+def _sl_apply_live_points(matchups, rosters, scoring_settings, week):
+    """Sleeper's /matchups points lag the live stats feed by a minute or more.
+    Re-score every player from the live box stats with the league's own
+    scoring settings (this reproduces Sleeper's totals exactly), keeping the
+    matchup value for anyone the stats feed doesn't list."""
+    ws = _cur_week_stats()
+    if not ws or not scoring_settings or _WSTATS.get("wk") != int(week):
+        return
+    roster_players = {r["roster_id"]: (r.get("players") or []) for r in rosters}
+    for m in matchups:
+        pp = dict(m.get("players_points") or {})
+        starters = [str(s) for s in (m.get("starters") or [])]
+        ids = set(starters) | {str(p) for p in (m.get("players") or [])} \
+            | {str(p) for p in roster_players.get(m.get("roster_id"), [])}
+        for pid in ids:
+            s = ws.get(pid)
+            if s:
+                pp[pid] = round(sum(v * scoring_settings[k] for k, v in s.items()
+                                    if k in scoring_settings
+                                    and isinstance(v, (int, float))), 2)
+        m["players_points"] = pp
+        m["points"] = round(sum(pp.get(s) or 0 for s in starters if s != "0"), 2)
 
 
 def _espn_to_sleeper_map():
@@ -510,6 +535,10 @@ def _sl_common(league_id, week):
     rosters = _get_json(f"{SLEEPER}/league/{league_id}/rosters")
     users = _get_json(f"{SLEEPER}/league/{league_id}/users")
     matchups = _get_json(f"{SLEEPER}/league/{league_id}/matchups/{week}")
+    try:
+        _sl_apply_live_points(matchups, rosters, league.get("scoring_settings"), week)
+    except Exception as e:
+        print(f"[sleeper] live re-score failed, using matchup points: {e}")
     rec = (league.get("scoring_settings") or {}).get("rec", 0)
     scoring = 1 if rec >= 1 else (0.5 if rec >= 0.4 else 0)
     projections = _sleeper_projections(league.get("season"), week, scoring)
@@ -590,25 +619,193 @@ def sleeper_all_rosters(league_id, week, players, nfl, my_user_id=None, override
     league, rosters, roster_by_id, user_name, matchups, projections, slots = _sl_common(
         league_id, week)
     by_roster = {m["roster_id"]: m for m in matchups}
-    fc = _fc_for(len(rosters), _sleeper_val_params(league, override))
+    params = _sleeper_val_params(league, override)
+    fc = _fc_for(len(rosters), params)
     gstart = _global_starters(matchups)
+    season = str(league.get("season") or sleeper_state().get("season"))
+    sstats, byes = season_stats(season), nfl_byes(season)
     teams = []
     for r in rosters:
         m = by_roster.get(r["roster_id"])
         if m is None:
             continue
         t = _sl_build_team(m, r, user_name, players, projections, nfl, slots, gstart)
+        st = r.get("settings") or {}
+        t["id"] = r["roster_id"]
         t["is_me"] = my_user_id is not None and r.get("owner_id") == my_user_id
+        t["wins"], t["losses"], t["ties"] = st.get("wins", 0), st.get("losses", 0), st.get("ties", 0)
+        t["pf"] = round(st.get("fpts", 0) + st.get("fpts_decimal", 0) / 100, 2)
+        t["pa"] = round(st.get("fpts_against", 0) + st.get("fpts_against_decimal", 0) / 100, 2)
         _fc_enrich_team(t, fc)
+        _season_enrich_team(t, sstats, byes, params["ppr"])
         teams.append(t)
     _rank_strength(teams)
     teams.sort(key=lambda t: -(t["score"] or 0))
+    settings = league.get("settings") or {}
     return {
         "provider": "sleeper",
+        "league_id": str(league_id),
         "league_name": league.get("name", "Sleeper league"),
         "week": week,
+        "season": season,
+        "slots": slots,
+        "scoring": {"ppr": params["ppr"], "num_qbs": params["num_qbs"],
+                    "dynasty": params["dynasty"], "teams": len(rosters),
+                    "playoff_teams": settings.get("playoff_teams") or 6,
+                    "playoff_start": settings.get("playoff_week_start") or 15},
         "teams": teams,
     }
+
+
+# --------------------------------------------------------------------------
+# Season-to-date stats (one bulk call, cached) -> ppg / games / snap share,
+# used by the trade center and the AI dossier.
+# --------------------------------------------------------------------------
+_SEASON_STATS = {"ts": 0, "season": None, "data": {}}
+
+
+def season_stats(season):
+    now = time.time()
+    if _SEASON_STATS["season"] == str(season) and now - _SEASON_STATS["ts"] < 600:
+        return _SEASON_STATS["data"]
+    url = (f"https://api.sleeper.com/stats/nfl/{season}?season_type=regular"
+           "&position[]=QB&position[]=RB&position[]=WR&position[]=TE"
+           "&position[]=K&position[]=DEF&order_by=pts_ppr")
+    out = {}
+    try:
+        for e in _get_json(url, timeout=25) or []:
+            pid, s = str(e.get("player_id") or ""), e.get("stats") or {}
+            if pid and s:
+                out[pid] = s
+    except Exception as ex:
+        print(f"[stats] season stats failed: {ex}")
+        if _SEASON_STATS["data"]:
+            return _SEASON_STATS["data"]
+    _SEASON_STATS.update(ts=now, season=str(season), data=out)
+    return out
+
+
+def _sid_for(p):
+    """Best-effort Sleeper id for any player dict (Sleeper or ESPN built)."""
+    if p.get("sleeper_id"):
+        return str(p["sleeper_id"])
+    pos = (p.get("pos") or "").upper()
+    if pos in ("DEF", "D/ST"):
+        return canon_team(p.get("team"))
+    if p.get("espn_id"):
+        sid = _espn_to_sleeper_map().get(str(p["espn_id"]))
+        if sid:
+            return sid
+    if p.get("name"):
+        idx = _sleeper_name_index()
+        return (idx["nt"].get(_norm_name(p["name"]) + "|" + canon_team(p.get("team")))
+                or idx["nm"].get(_norm_name(p["name"])))
+    return None
+
+
+def _season_enrich_team(t, sstats, byes, ppr=1):
+    key = "pts_ppr" if ppr >= 1 else ("pts_half_ppr" if ppr >= 0.4 else "pts_std")
+    for p in (t.get("players") or []) + (t.get("bench") or []):
+        if not p.get("name") or p["name"] == "(empty)":
+            continue
+        p["bye"] = byes.get(p.get("team")) if byes else None
+        s = sstats.get(_sid_for(p) or "")
+        if not s:
+            p["ppg"] = p["gp"] = p["snap_pct"] = None
+            continue
+        gp = s.get("gp") or 0
+        pts = s.get(key) or 0
+        p["gp"] = int(gp)
+        p["ppg"] = round(pts / gp, 1) if gp else None
+        off, tm = s.get("off_snp"), s.get("tm_off_snp")
+        p["snap_pct"] = round(100 * off / tm) if off and tm else None
+
+
+def _espn_lineup_slots(league):
+    """Ordered lineup slot labels for an ESPN league from its roster settings."""
+    counts = (((league.get("settings") or {}).get("rosterSettings") or {})
+              .get("lineupSlotCounts") or {})
+    label = {0: "QB", 1: "QB", 2: "RB", 3: "WRRB", 4: "WR", 5: "WRT", 6: "TE",
+             23: "FLEX", 7: "SFLEX", 16: "DEF", 17: "K"}
+    out = []
+    for sid, n in counts.items():
+        sid = int(sid)
+        if sid in label and n:
+            out.extend([(ESPN_SLOT_ORDER.get(sid, 90), label[sid])] * int(n))
+    out.sort(key=lambda x: x[0])
+    return [l for _, l in out]
+
+
+# --------------------------------------------------------------------------
+# Recent trades in a league (Sleeper transactions / ESPN mTransactions2)
+# --------------------------------------------------------------------------
+def league_trades_sleeper(league_id, week, players, limit=10):
+    league, rosters, roster_by_id, user_name, _m, _p, _s = _sl_common(league_id, week)
+    team_of = {r["roster_id"]: user_name.get(r.get("owner_id"), f"Team {r['roster_id']}")
+               for r in rosters}
+
+    def pname(pid):
+        m = players.get(str(pid)) or {}
+        if pos_is_def(m):
+            return f"{canon_team(m.get('team') or pid)} D/ST"
+        return m.get("full_name") or str(pid)
+
+    out = []
+    for wk in range(int(week), 0, -1):
+        try:
+            txs = _get_json(f"{SLEEPER}/league/{league_id}/transactions/{wk}")
+        except Exception:
+            continue
+        for tx in txs:
+            if tx.get("type") != "trade" or tx.get("status") != "complete":
+                continue
+            sides = {}
+            for pid, rid in (tx.get("adds") or {}).items():
+                sides.setdefault(rid, {"team": team_of.get(rid, "?"), "gets": [], "picks": []})
+                sides[rid]["gets"].append({"name": pname(pid),
+                                           "pos": (players.get(str(pid)) or {}).get("position"),
+                                           "sleeper_id": str(pid)})
+            for pk in tx.get("draft_picks") or []:
+                rid = pk.get("owner_id")
+                sides.setdefault(rid, {"team": team_of.get(rid, "?"), "gets": [], "picks": []})
+                sides[rid]["picks"].append(f"{pk.get('season')} R{pk.get('round')}")
+            out.append({"week": wk, "when": tx.get("status_updated"),
+                        "sides": list(sides.values())})
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def league_trades_espn(league_id, espn_s2, swid, season, limit=10):
+    cookie = f"espn_s2={espn_s2}; SWID={swid}"
+    url = (f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{season}"
+           f"/segments/0/leagues/{league_id}?view=mTransactions2&view=mTeam&view=kona_player_info")
+    d = _get_json(url, cookies=cookie, timeout=20)
+    team_of = {}
+    for t in d.get("teams") or []:
+        team_of[t.get("id")] = t.get("name") or f"{t.get('location', '')} {t.get('nickname', '')}".strip()
+    pname = {}
+    for p in d.get("players") or []:
+        pl = p.get("player") or {}
+        if pl.get("id") is not None:
+            pname[pl["id"]] = (pl.get("fullName"), ESPN_POS.get(pl.get("defaultPositionId")))
+    out = []
+    txs = [t for t in (d.get("transactions") or [])
+           if "TRADE" in (t.get("type") or "") and t.get("status") == "EXECUTED"]
+    txs.sort(key=lambda t: -(t.get("processDate") or 0))
+    for tx in txs[:limit]:
+        sides = {}
+        for it in tx.get("items") or []:
+            to = it.get("toTeamId")
+            if to is None or to < 0:
+                continue
+            nm, pos = pname.get(it.get("playerId"), (str(it.get("playerId")), None))
+            sides.setdefault(to, {"team": team_of.get(to, "?"), "gets": [], "picks": []})
+            sides[to]["gets"].append({"name": nm, "pos": "DEF" if pos == "D/ST" else pos,
+                                      "espn_id": str(it.get("playerId"))})
+        out.append({"week": tx.get("scoringPeriodId"), "when": tx.get("processDate"),
+                    "sides": list(sides.values())})
+    return out
 
 
 def _rank_strength(teams):
@@ -805,21 +1002,37 @@ def espn_all_rosters(league_id, espn_s2, swid, season, week, nfl, override=None)
     league_name = (league.get("settings") or {}).get("name", "ESPN league")
     raw_teams = league.get("teams", [])
     my_id = _espn_my_team_id(league, swid)
-    fc = _fc_for(len(raw_teams), _espn_val_params(league, override))
+    params = _espn_val_params(league, override)
+    fc = _fc_for(len(raw_teams), params)
+    sstats, byes = season_stats(season), nfl_byes(str(season))
     teams = []
     for raw in raw_teams:
         t = _espn_build_team(raw, week, nfl)
         if not t:
             continue
+        ov = (raw.get("record") or {}).get("overall", {})
+        t["id"] = raw.get("id")
         t["is_me"] = raw.get("id") == my_id
+        t["wins"], t["losses"], t["ties"] = ov.get("wins", 0), ov.get("losses", 0), ov.get("ties", 0)
+        t["pf"] = round(ov.get("pointsFor", 0), 2)
+        t["pa"] = round(ov.get("pointsAgainst", 0), 2)
         _fc_enrich_team(t, fc)
+        _season_enrich_team(t, sstats, byes, params["ppr"])
         teams.append(t)
     _rank_strength(teams)
     teams.sort(key=lambda t: -(t["score"] or 0))
+    ss = ((league.get("settings") or {}).get("scheduleSettings") or {})
     return {
         "provider": "espn",
+        "league_id": str(league_id),
         "league_name": league_name,
         "week": week,
+        "season": str(season),
+        "slots": _espn_lineup_slots(league),
+        "scoring": {"ppr": params["ppr"], "num_qbs": params["num_qbs"],
+                    "dynasty": params["dynasty"], "teams": len(raw_teams),
+                    "playoff_teams": ss.get("playoffTeamCount") or 6,
+                    "playoff_start": (ss.get("matchupPeriodCount") or 14) + 1},
         "teams": teams,
     }
 
@@ -1132,9 +1345,28 @@ def _stat_dir(name):
     return "low" if any(k in n for k in _STAT_LOW) else "high"
 
 
+# ESPN kicker game-log columns ("made-attempted" by distance) -> points per make.
+# Standard scoring: FG 0-39 = 3, 40-49 = 4, 50+ = 5, XP = 1, any miss = -1.
+_KICK_SCORE = {
+    "fieldGoalsMade1_19-fieldGoalAttempts1_19": 3,
+    "fieldGoalsMade20_29-fieldGoalAttempts20_29": 3,
+    "fieldGoalsMade30_39-fieldGoalAttempts30_39": 3,
+    "fieldGoalsMade40_49-fieldGoalAttempts40_49": 4,
+    "fieldGoalsMade50-fieldGoalAttempts50": 5,
+    "extraPointsMade-extraPointAttempts": 1,
+}
+
+
 def _espn_fpts(names, stats):
     total = 0.0
     for nm, val in zip(names, stats):
+        if nm in _KICK_SCORE:               # kicker columns are "made-attempted"
+            try:
+                made, att = (int(x) for x in str(val).split("-")[:2])
+            except ValueError:
+                continue
+            total += made * _KICK_SCORE[nm] - (att - made)   # -1 per miss
+            continue
         w = _PPR_SCORE.get(nm)
         if w is None:
             continue
@@ -1215,6 +1447,9 @@ _SLEEPER_GL_COLS = [
     ("rec_tgt", "TGT", "RECEIVING", "high"), ("rec", "REC", "RECEIVING", "high"),
     ("rec_yd", "YDS", "RECEIVING", "high"), ("rec_td", "TD", "RECEIVING", "high"),
     ("fum_lost", "FL", "FUMBLES", "low"),
+    ("fgm", "FGM", "KICKING", "high"), ("fga", "FGA", "KICKING", "high"),
+    ("fgm_lng", "LNG", "KICKING", "high"),
+    ("xpm", "XPM", "KICKING", "high"), ("xpa", "XPA", "KICKING", "high"),
 ]
 
 

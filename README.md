@@ -41,10 +41,13 @@ leagues. It only reads public/undocumented endpoints to display data.
 - **Power rankings** with week-over-week movement.
 - **Strength of schedule**, **bye-week planner**, **waivers** (best available + Sleeper trending), **buy-low / sell-high**, **Vegas edge** (implied vs. projection), and a **weekly recap**.
 
-**Trade tools**
-- **Trade machine** — pick any two teams, select players, get a live fair/uneven verdict by trade value.
-- **Trade finder** — balanced swap suggestions with a **fairness slider**, **fill-my-needs** filter (optionally starters-only), and **target-position** toggles.
-- **Trade block** — star your players and scan the whole league for fair offers.
+**Trade Center** (per league, also reachable from any team in the rosters view)
+- **Deal builder** — any two teams, rosters grouped by position with value, positional rank, 30-day trend, season **points per game**, **snap share**, injuries and **bye weeks**; tap players to build the deal.
+- **Lineup impact**, not just value sums — for both sides: change in starting-lineup value, change in this week's projected starters, who enters/leaves the lineup, and roster spots freed/needed.
+- **Trade partners rail** — every team ranked by how well their surplus fits your needs (and vice-versa), with needs/depth tags.
+- **Finder** — balanced swaps with one partner, a **whole-league scan** (1-for-1, 2-for-1, 1-for-2), or offers for your **★ trade block**; filters for fairness band, "must upgrade my starters", fill-my-needs, target positions, positions to keep out, and **🔒 untouchables**.
+- **AI analyst** — evaluates the deal on the board (grades, verdict, what each side gets, risks, lineup impact, a counter-offer and a ready-to-send pitch), **suggests trades** across the league, or answers free-form questions. It's fed the league's settings, standings and playoff odds, both rosters with values and season stats, plus news, outlooks, Vegas lines and recent games for the players involved. Works with your **Claude or ChatGPT account** (via the Claude Code / Codex CLI — no API key) or an Anthropic / OpenAI / OpenAI-compatible API key.
+- **League trade history**, **saved proposals**, and a one-click **copy for league chat**.
 - Trade values, ranks, and 30-day trends via [FantasyCalc](https://fantasycalc.com).
 
 ---
@@ -81,6 +84,19 @@ python3 server.py
 
 Open **http://localhost:8787** in your browser. Leave the terminal running during
 games; press `Ctrl+C` to stop. Use a different port with `PORT=9000 python3 server.py`.
+
+**3. (Optional) Turn on the AI trade analyst**
+
+Click **⚙** in the app and pick how to connect:
+
+- **Claude account** — uses the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
+  already signed in on your machine (`npm i -g @anthropic-ai/claude-code`, then run `claude` once to log in). No API key.
+- **ChatGPT account** — uses the [Codex CLI](https://github.com/openai/codex) signed in with
+  ChatGPT (`npm i -g @openai/codex`, then `codex login`). No API key.
+- **API key** — Anthropic, OpenAI, or any OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter…).
+
+Settings are saved to your local `config.json` (or set `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`).
+League data is sent to the provider only when you press an AI button.
 
 ---
 
