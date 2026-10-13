@@ -16,6 +16,7 @@
     </div>
     <nav class="nav" id="nav">
       <button class="navbtn active" data-view="live">⚡ Live</button>
+      <button class="navbtn" data-view="gameday">📺 Game Day</button>
       <button class="navbtn" data-view="rosters">👥 Rosters</button>
       <button class="navbtn" data-view="trade">⇄ Trade</button>
       <button class="navbtn" data-view="lab">📊 Lab</button>
@@ -50,6 +51,7 @@
     <main id="grid" class="grid"></main>
   </section>
 
+  <section id="view-gameday" class="view" hidden></section>
   <section id="view-rosters" class="view" hidden></section>
   <section id="view-trade" class="view" hidden></section>
   <section id="view-lab" class="view" hidden></section>
@@ -84,5 +86,6 @@
 
   <script src="/static/app.js"></script>
   <script src="/static/trade.js"></script>
+  <script src="/static/gameday.js"></script>
 </body>
 </html>

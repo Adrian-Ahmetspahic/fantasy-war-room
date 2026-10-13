@@ -54,14 +54,16 @@ _SSL_UNVERIFIED = ssl._create_unverified_context()
 # --------------------------------------------------------------------------
 # tiny HTTP helper
 # --------------------------------------------------------------------------
-def _get_json(url, cookies=None, timeout=15, retries=2):
+def _get_json(url, cookies=None, timeout=15, retries=2, headers=None):
     """GET + parse JSON, retrying transient failures. Sleeper/ESPN
     intermittently return 404/5xx or time out under load (e.g. kickoff day);
     a couple of quick retries stops those blips from crashing a whole card."""
-    headers = {"User-Agent": UA, "Accept": "application/json"}
+    hdrs = {"User-Agent": UA, "Accept": "application/json"}
     if cookies:
-        headers["Cookie"] = cookies
-    req = urllib.request.Request(url, headers=headers)
+        hdrs["Cookie"] = cookies
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, headers=hdrs)
     last = None
     for attempt in range(retries + 1):
         try:
@@ -173,6 +175,13 @@ def nfl_game_status(force=False):
                 abbr = canon_team(team.get("abbreviation"))
                 if abbr:
                     comps.append((abbr, c.get("homeAway"), team))
+            scores = {}
+            for c in comp.get("competitors", []):
+                a = canon_team((c.get("team") or {}).get("abbreviation"))
+                try:
+                    scores[a] = int(c.get("score") or 0)
+                except (TypeError, ValueError):
+                    scores[a] = 0
             for i, (abbr, ha, team) in enumerate(comps):
                 other = comps[1 - i][0] if len(comps) == 2 else None
                 out[abbr] = {
@@ -181,6 +190,10 @@ def nfl_game_status(force=False):
                     "redzone": rz and str(team.get("id")) == str(poss_id),
                     "opp": other,
                     "ha": "@" if ha == "away" else "vs",
+                    "event": event.get("id"),
+                    "pts": scores.get(abbr, 0),
+                    "opp_pts": scores.get(other, 0) if other else None,
+                    "possession": str(team.get("id")) == str(poss_id),
                 }
     except Exception as e:  # scoreboard is best-effort; never fatal
         print(f"[nfl] scoreboard fetch failed: {e}")
@@ -703,15 +716,51 @@ def _sid_for(p):
     return None
 
 
+def _season_line(pos, s, gp):
+    """Compact season usage line, e.g. '7.2 tgt/g, 5.1 rec, 61 yd, 4 TD'."""
+    if not s or not gp:
+        return None
+    pg = lambda k: (s.get(k) or 0) / gp
+    n = lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}"
+    pos = (pos or "").upper()
+    P = []
+    if pos == "QB":
+        P.append(f"{n(pg('pass_yd'))} pass yd/g, {s.get('pass_td') or 0:.0f} TD, {s.get('pass_int') or 0:.0f} INT")
+        if s.get("rush_yd"):
+            P.append(f"{n(pg('rush_yd'))} rush yd/g, {s.get('rush_td') or 0:.0f} rush TD")
+    elif pos == "RB":
+        P.append(f"{n(pg('rush_att'))} car/g, {n(pg('rush_yd'))} yd/g, {s.get('rush_td') or 0:.0f} rush TD")
+        P.append(f"{n(pg('rec_tgt'))} tgt/g, {n(pg('rec'))} rec/g, {s.get('rec_td') or 0:.0f} rec TD")
+    elif pos in ("WR", "TE"):
+        P.append(f"{n(pg('rec_tgt'))} tgt/g, {n(pg('rec'))} rec/g, {n(pg('rec_yd'))} yd/g, {s.get('rec_td') or 0:.0f} TD")
+    elif pos == "K":
+        P.append(f"{s.get('fgm') or 0:.0f}/{s.get('fga') or 0:.0f} FG, {s.get('xpm') or 0:.0f} XP")
+    elif pos == "DEF":
+        P.append(f"{s.get('sack') or 0:.0f} sacks, {s.get('int') or 0:.0f} INT, {s.get('def_td') or 0:.0f} TD")
+    return "; ".join(P) or None
+
+
 def _season_enrich_team(t, sstats, byes, ppr=1):
     key = "pts_ppr" if ppr >= 1 else ("pts_half_ppr" if ppr >= 0.4 else "pts_std")
+    try:
+        pdb = sleeper_players()
+    except Exception:
+        pdb = {}
     for p in (t.get("players") or []) + (t.get("bench") or []):
         if not p.get("name") or p["name"] == "(empty)":
             continue
         p["bye"] = byes.get(p.get("team")) if byes else None
-        s = sstats.get(_sid_for(p) or "")
+        sid = _sid_for(p) or ""
+        meta = pdb.get(sid) or {}
+        if meta:
+            p["age"] = meta.get("age")
+            p["exp"] = meta.get("years_exp")
+            if meta.get("injury_status"):
+                note = " · ".join(x for x in (meta.get("injury_body_part"), meta.get("injury_notes")) if x)
+                p["injury_note"] = note or None
+        s = sstats.get(sid)
         if not s:
-            p["ppg"] = p["gp"] = p["snap_pct"] = None
+            p["ppg"] = p["gp"] = p["snap_pct"] = p["season_line"] = None
             continue
         gp = s.get("gp") or 0
         pts = s.get(key) or 0
@@ -719,6 +768,7 @@ def _season_enrich_team(t, sstats, byes, ppr=1):
         p["ppg"] = round(pts / gp, 1) if gp else None
         off, tm = s.get("off_snp"), s.get("tm_off_snp")
         p["snap_pct"] = round(100 * off / tm) if off and tm else None
+        p["season_line"] = _season_line(p.get("pos"), s, gp)
 
 
 def _espn_lineup_slots(league):
@@ -777,34 +827,62 @@ def league_trades_sleeper(league_id, week, players, limit=10):
 
 
 def league_trades_espn(league_id, espn_s2, swid, season, limit=10):
+    """Completed trades from ESPN's league activity feed. (The transactions
+    view only lists the roster drops attached to a trade; the feed's
+    message type 224 carries every player moved, with from/to team.)"""
     cookie = f"espn_s2={espn_s2}; SWID={swid}"
-    url = (f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{season}"
-           f"/segments/0/leagues/{league_id}?view=mTransactions2&view=mTeam&view=kona_player_info")
-    d = _get_json(url, cookies=cookie, timeout=20)
-    team_of = {}
-    for t in d.get("teams") or []:
-        team_of[t.get("id")] = t.get("name") or f"{t.get('location', '')} {t.get('nickname', '')}".strip()
-    pname = {}
-    for p in d.get("players") or []:
-        pl = p.get("player") or {}
-        if pl.get("id") is not None:
-            pname[pl["id"]] = (pl.get("fullName"), ESPN_POS.get(pl.get("defaultPositionId")))
+    base = (f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{season}"
+            f"/segments/0/leagues/{league_id}")
+    teams = _get_json(base + "?view=mTeam", cookies=cookie, timeout=20)
+    team_of = {t.get("id"): t.get("name") or f"{t.get('location', '')} {t.get('nickname', '')}".strip()
+               for t in teams.get("teams") or []}
+    feed = _get_json(base + "/communication/?view=kona_league_communication", cookies=cookie, timeout=20)
+    trades = []
+    for tp in feed.get("topics") or []:
+        msgs = [m for m in (tp.get("messages") or []) if m.get("messageTypeId") == 224]
+        if not msgs:
+            continue
+        trades.append((tp.get("date") or 0, msgs))
+    trades.sort(key=lambda x: -x[0])
+    trades = trades[:limit]
+    ids = sorted({m.get("targetId") for _, ms in trades for m in ms if m.get("targetId") is not None})
+    names = {}
+    e2s = _espn_to_sleeper_map()
+    pdb = sleeper_players()
+    for pid in ids:
+        if pid < 0:                       # ESPN D/ST ids are -16000 - proTeamId
+            ab = canon_team(ESPN_PRO_TEAM.get(-16000 - pid, ""))
+            names[pid] = (f"{ab} D/ST", "DEF")
+            continue
+        sid = e2s.get(str(pid))
+        meta = pdb.get(sid) if sid else None
+        if meta:
+            names[pid] = (meta.get("full_name") or str(pid), meta.get("position"))
+    missing = [pid for pid in ids if pid not in names]
+    if missing:
+        try:
+            flt = json.dumps({"players": {"filterIds": {"value": missing}}})
+            d = _get_json(base + "?view=kona_player_info", cookies=cookie, timeout=20,
+                          headers={"x-fantasy-filter": flt})
+            for p in d.get("players") or []:
+                pl = p.get("player") or {}
+                if pl.get("id") in missing:
+                    pos = ESPN_POS.get(pl.get("defaultPositionId"))
+                    names[pl["id"]] = (pl.get("fullName"), "DEF" if pos == "D/ST" else pos)
+        except Exception as e:
+            print(f"[trades] espn player lookup failed: {e}")
     out = []
-    txs = [t for t in (d.get("transactions") or [])
-           if "TRADE" in (t.get("type") or "") and t.get("status") == "EXECUTED"]
-    txs.sort(key=lambda t: -(t.get("processDate") or 0))
-    for tx in txs[:limit]:
+    for when, msgs in trades:
         sides = {}
-        for it in tx.get("items") or []:
-            to = it.get("toTeamId")
-            if to is None or to < 0:
+        for m in msgs:
+            to, pid = m.get("to"), m.get("targetId")
+            if to is None or pid is None:
                 continue
-            nm, pos = pname.get(it.get("playerId"), (str(it.get("playerId")), None))
-            sides.setdefault(to, {"team": team_of.get(to, "?"), "gets": [], "picks": []})
-            sides[to]["gets"].append({"name": nm, "pos": "DEF" if pos == "D/ST" else pos,
-                                      "espn_id": str(it.get("playerId"))})
-        out.append({"week": tx.get("scoringPeriodId"), "when": tx.get("processDate"),
-                    "sides": list(sides.values())})
+            nm, pos = names.get(pid, (f"Player {pid}", None))
+            sides.setdefault(to, {"team": team_of.get(to, f"Team {to}"), "gets": [], "picks": []})
+            sides[to]["gets"].append({"name": nm, "pos": pos, "espn_id": str(pid) if pid > 0 else ""})
+        if sides:
+            out.append({"week": None, "when": when, "sides": list(sides.values())})
     return out
 
 
@@ -1429,6 +1507,7 @@ def espn_gamelog(espn_id, season=None):
                 "fpts": fpts,
                 "values": [fpts] + list(stats),
                 "playoff": playoff,
+                "team": canon_team((m.get("team") or {}).get("abbreviation")),
             })
     rows.sort(key=lambda r: (r["playoff"],
                              r["week"] if isinstance(r["week"], int) else 999))
@@ -1491,13 +1570,14 @@ def sleeper_gamelog(sleeper_id, season):
             "week": wk, "atVs": "@" if e.get("is_away_team") else "vs",
             "opp": opp, "opp_logo": _logo_url(opp),
             "result": None, "score": None, "fpts": fpts,
-            "values": vals, "playoff": False,
+            "values": vals, "playoff": False, "team": canon_team(e.get("team")),
         })
     return {"season": str(season), "columns": columns, "rows": rows}
 
 
-def player_gamelog(espn_id, sleeper_id, season=None):
-    """Unified game log: ESPN when it returns data, else Sleeper weekly stats."""
+def player_gamelog(espn_id, sleeper_id, season=None, team=None):
+    """Unified game log: ESPN when it returns data, else Sleeper weekly stats.
+    Missed games (team played, player did not) are filled in as zero rows."""
     seasons = None
     if espn_id:
         try:
@@ -1533,6 +1613,10 @@ def player_gamelog(espn_id, sleeper_id, season=None):
     gl = gl or {"season": str(target) if target else None, "columns": [], "rows": []}
     gl["seasons"] = seasons or ([gl.get("season")] if gl.get("season") else [])
     gl["season"] = gl.get("season") or (str(target) if target else None)
+    try:
+        _fill_missed_games(gl, gl.get("season"), team)
+    except Exception as e:
+        print(f"[gamelog] missed-games fill failed: {e}")
     return gl
 
 
@@ -1852,7 +1936,7 @@ def player_profile(espn_id, sleeper_id, team, pos, name, season):
     with _Pool(max_workers=6) as ex:
         if espn_id or sleeper_id:
             # None -> builder auto-selects the latest season with games
-            jobs["gamelog"] = ex.submit(player_gamelog, espn_id, sleeper_id, None)
+            jobs["gamelog"] = ex.submit(player_gamelog, espn_id, sleeper_id, None, team)
         if espn_id:
             jobs["espn_news"] = ex.submit(espn_news, espn_id)
             jobs["depth"] = ex.submit(espn_depth_chart, team, season, espn_id)
@@ -1888,6 +1972,19 @@ def player_profile(espn_id, sleeper_id, team, pos, name, season):
             result["injury"] = _injury_code(meta.get("injury_status"))
     except Exception:
         pass
+    try:
+        sid = sleeper_id or _sid_for({"espn_id": espn_id, "name": name, "team": team, "pos": pos})
+        ranks = season_pos_ranks(season)
+        sr = ranks.get(str(sid)) if sid else None
+        if sr is None:                       # no stats this season (injured all year, etc.)
+            pos_n = "DEF" if (pos or "").upper() in ("DEF", "D/ST") else (pos or "").upper()
+            same = [r for r in ranks.values() if r["pos"] == pos_n]
+            sr = {"pos": pos_n, "total_rank": None, "total_pts": 0.0, "ppg_rank": None, "ppg": None,
+                  "gp": 0, "n": len(same), "n_ppg": sum(1 for r in same if r["gp"]), "season": str(season)}
+        result["season_rank"] = sr
+    except Exception as e:
+        print(f"[profile] season rank failed: {e}")
+        result["season_rank"] = None
     return result
 
 
@@ -2186,9 +2283,21 @@ def _assemble_lab(league_id, provider, name, week, teams, schedule,
             "value_total", "strength_rank", "prev_rank", "movement", "score",
             "playoff_pct")
     standings = sorted(teams, key=lambda x: (-(x.get("wins") or 0), -(x.get("pf") or 0)))
+    name_of = {t["id"]: t["name"] for t in teams}
+    this_week, seen = [], set()
+    for tid, opps in schedule.items():
+        opp = opps.get(cur_week)
+        if opp is None or (opp, tid) in seen:
+            continue
+        seen.add((tid, opp))
+        this_week.append({"a": name_of.get(tid), "b": name_of.get(opp)})
+    remaining = {name_of.get(tid): [f"wk{w}: {name_of.get(o)}" for w, o in sorted(opps.items())
+                                    if cur_week < w < playoff_start]
+                 for tid, opps in schedule.items() if tid in name_of}
     return {
         "provider": provider, "league_name": name, "week": week,
         "playoff_start": playoff_start, "playoff_teams": playoff_teams,
+        "matchups_week": this_week, "remaining": remaining,
         "teams": [{k: t.get(k) for k in keys} for t in standings],
         "power": [{"name": t["name"], "is_me": t.get("is_me"),
                    "value_total": t["value_total"], "rank": t["strength_rank"],
@@ -2279,3 +2388,379 @@ def league_lab_espn(league_id, espn_s2, swid, season, week, nfl, override=None):
     return _assemble_lab(league_id, "espn", name, week, teams, schedule,
                          week, playoff_start, playoff_teams, fc, [],
                          nfl_byes(str(season)))
+
+
+# --------------------------------------------------------------------------
+# Game Day: live play-by-play feed for a matchup's players (ESPN summary),
+# per-player live box (Sleeper week stats), Vegas-based lineup optimizer
+# --------------------------------------------------------------------------
+_PLAYS_CACHE = {}          # event_id -> {"ts", "data"}
+_ESPN_TEAM_ABBR = {str(k): v for k, v in ESPN_PRO_TEAM.items() if v}
+
+
+def espn_game_plays(event_id):
+    """All plays so far in one NFL game (newest last), cached ~15s."""
+    now = time.time()
+    c = _PLAYS_CACHE.get(str(event_id))
+    if c and now - c["ts"] < 15:
+        return c["data"]
+    s = _get_json("https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary"
+                  f"?event={event_id}", timeout=20)
+    drives = s.get("drives") or {}
+    raw = []
+    for d in (drives.get("previous") or []):
+        raw.extend(d.get("plays") or [])
+    cur = drives.get("current")
+    if cur:
+        raw.extend(cur.get("plays") or [])
+    hdr = (s.get("header") or {}).get("competitions") or [{}]
+    comps = hdr[0].get("competitors") or []
+    home = away = None
+    for cp in comps:
+        ab = canon_team((cp.get("team") or {}).get("abbreviation"))
+        if cp.get("homeAway") == "home":
+            home = ab
+        else:
+            away = ab
+    seen, plays = set(), []
+    for p in raw:
+        pid = p.get("id")
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        poss = canon_team(_ESPN_TEAM_ABBR.get(str(((p.get("start") or {}).get("team") or {}).get("id"))))
+        plays.append({
+            "id": pid, "seq": int(p.get("sequenceNumber") or 0),
+            "text": p.get("text") or "", "type": ((p.get("type") or {}).get("text")) or "",
+            "period": (p.get("period") or {}).get("number"),
+            "clock": (p.get("clock") or {}).get("displayValue"),
+            "scoring": bool(p.get("scoringPlay")), "turnover": bool(p.get("isTurnover")),
+            "wallclock": p.get("wallclock"), "yards": p.get("statYardage"),
+            "poss": poss, "home_score": p.get("homeScore"), "away_score": p.get("awayScore"),
+        })
+    plays.sort(key=lambda x: x["seq"])
+    data = {"event": str(event_id), "home": home, "away": away, "plays": plays}
+    _PLAYS_CACHE[str(event_id)] = {"ts": now, "data": data}
+    return data
+
+
+_SUFFIX_RE = _re.compile(r"\b(jr|sr|ii|iii|iv|v)\.?$", _re.I)
+
+
+def _play_name_regex(name):
+    """ESPN play text abbreviates players as 'D.Maye' / 'Ja.Williams' /
+    'A.St. Brown'. Build a regex matching that form for a full name."""
+    nm = _SUFFIX_RE.sub("", (name or "").strip()).strip()
+    parts = nm.split()
+    if len(parts) < 2:
+        return None
+    first, last = parts[0], " ".join(parts[1:])
+    last_rx = _re.escape(last).replace(r"\.", r"\.?").replace(r"\ ", r"\s?")
+    return _re.compile(r"\b" + _re.escape(first[0]) + r"[a-z]{0,2}\.\s?" + last_rx + r"\b")
+
+
+_DEF_PLAY_TYPES = ("interception", "sack", "fumble recovery (opponent)", "safety",
+                   "blocked", "defensive")
+
+
+def live_feed(players, limit=250):
+    """Events from every NFL game involving the given players, newest first.
+    players: [{name, team, pos, side}] where side is 'me' / 'opp'."""
+    nfl = nfl_game_status()
+    by_event = {}
+    for p in players:
+        team = canon_team(p.get("team"))
+        g = nfl.get(team) or {}
+        if not g.get("event") or g.get("status") == "pre":
+            continue
+        by_event.setdefault(g["event"], []).append(dict(p, team=team))
+    games, events = [], []
+    for eid, plist in by_event.items():
+        try:
+            gp = espn_game_plays(eid)
+        except Exception as e:
+            print(f"[feed] plays for {eid} failed: {e}")
+            continue
+        home, away = gp["home"], gp["away"]
+        st = nfl.get(home) or nfl.get(away) or {}
+        games.append({"event": eid, "home": home, "away": away,
+                      "home_pts": (nfl.get(home) or {}).get("pts"), "away_pts": (nfl.get(away) or {}).get("pts"),
+                      "status": st.get("status"), "detail": st.get("detail"),
+                      "players": [{"name": p["name"], "side": p.get("side"), "pos": p.get("pos")} for p in plist]})
+        skill = [(p, _play_name_regex(p["name"])) for p in plist
+                 if (p.get("pos") or "").upper() not in ("DEF", "D/ST")]
+        defs = [p for p in plist if (p.get("pos") or "").upper() in ("DEF", "D/ST")]
+        for pl in gp["plays"]:
+            hits = []
+            for p, rx in skill:
+                if rx and rx.search(pl["text"]):
+                    hits.append({"name": p["name"], "pos": p.get("pos"), "side": p.get("side"), "team": p["team"]})
+            tl = (pl["type"] or "").lower()
+            if defs and pl["poss"] and any(k in tl for k in _DEF_PLAY_TYPES):
+                for p in defs:
+                    if p["team"] != pl["poss"]:
+                        hits.append({"name": p["name"], "pos": "DEF", "side": p.get("side"), "team": p["team"]})
+            if not hits:
+                continue
+            events.append({**pl, "game": f"{away} @ {home}", "home": home, "away": away, "players": hits})
+    events.sort(key=lambda e: (e.get("wallclock") or "", e["seq"]), reverse=True)
+    return {"games": games, "events": events[:limit], "ts": int(time.time())}
+
+
+_LIVE_ROWS = {
+    "QB": [("pass_cmp", "Comp"), ("pass_att", "Att"), ("pass_yd", "Pass yds"), ("pass_td", "Pass TD"),
+           ("pass_int", "INT"), ("pass_sack", "Sacked"), ("rush_att", "Carries"), ("rush_yd", "Rush yds"),
+           ("rush_td", "Rush TD"), ("fum_lost", "Fumbles lost"), ("pass_rtg", "Rating")],
+    "RB": [("rush_att", "Carries"), ("rush_yd", "Rush yds"), ("rush_td", "Rush TD"), ("rush_lng", "Long"),
+           ("rec_tgt", "Targets"), ("rec", "Receptions"), ("rec_yd", "Rec yds"), ("rec_td", "Rec TD"),
+           ("fum_lost", "Fumbles lost"), ("off_snp", "Snaps")],
+    "WR": [("rec_tgt", "Targets"), ("rec", "Receptions"), ("rec_yd", "Rec yds"), ("rec_td", "Rec TD"),
+           ("rec_lng", "Long"), ("rec_rz_tgt", "RZ targets"), ("rush_att", "Carries"), ("rush_yd", "Rush yds"),
+           ("rush_td", "Rush TD"), ("fum_lost", "Fumbles lost"), ("off_snp", "Snaps")],
+    "K": [("fgm", "FG made"), ("fga", "FG att"), ("fgm_lng", "Long"), ("xpm", "XP made"), ("xpa", "XP att")],
+    "DEF": [("sack", "Sacks"), ("int", "INT"), ("fum_rec", "Fum rec"), ("def_td", "TD"), ("safe", "Safeties"),
+            ("pts_allow", "Pts allowed"), ("yds_allow", "Yds allowed"), ("blk_kick", "Blocked kicks")],
+}
+_LIVE_ROWS["TE"] = _LIVE_ROWS["WR"]
+
+
+def player_live(sleeper_id, espn_id, name, team, pos):
+    """Live/this-week box for one player from Sleeper's week stats + ESPN game state."""
+    pos_n = "DEF" if (pos or "").upper() in ("DEF", "D/ST") else (pos or "").upper()
+    sid = sleeper_id or _sid_for({"sleeper_id": sleeper_id, "espn_id": espn_id,
+                                  "name": name, "team": team, "pos": pos_n})
+    ws = _cur_week_stats()
+    s = ws.get(str(sid)) if sid else None
+    g = nfl_game_status().get(canon_team(team)) or {}
+    rows = []
+    for key, label in _LIVE_ROWS.get(pos_n, _LIVE_ROWS["WR"]):
+        v = (s or {}).get(key)
+        if v is None and key not in ("pass_yd", "rush_yd", "rec_yd", "rec", "rec_tgt", "rush_att", "pass_att", "fgm", "sack"):
+            continue
+        if key == "off_snp" and s and s.get("tm_off_snp"):
+            v = f"{_num(v or 0)} ({round(100 * (v or 0) / s['tm_off_snp'])}%)"
+        rows.append({"label": label, "value": _num(v or 0)})
+    pts = {k: round((s or {}).get(k) or 0, 2) for k in ("pts_ppr", "pts_half_ppr", "pts_std")}
+    return {
+        "name": name, "pos": pos_n, "team": canon_team(team), "sleeper_id": sid,
+        "week": _WSTATS.get("wk"), "found": bool(s),
+        "game": {"status": g.get("status", "pre"), "detail": g.get("detail", ""), "opp": g.get("opp"),
+                 "ha": g.get("ha"), "pts": g.get("pts"), "opp_pts": g.get("opp_pts"),
+                 "redzone": g.get("redzone"), "possession": g.get("possession")},
+        "rows": rows, "pts": pts, "statline": _statline(pos_n, s) if s else None,
+        "ts": int(time.time()),
+    }
+
+
+_SLOT_ELIG = {
+    "QB": ("QB",), "RB": ("RB",), "WR": ("WR",), "TE": ("TE",), "K": ("K",), "DEF": ("DEF",),
+    "FLEX": ("RB", "WR", "TE"), "SFLEX": ("QB", "RB", "WR", "TE"), "WRT": ("WR", "TE"),
+    "WRRB": ("WR", "RB"), "IDP": ("DL", "LB", "DB"),
+}
+
+
+def _best_lineup(players, slots, key):
+    """Greedy best lineup (most restrictive slots first). Returns [(slot, player|None)]."""
+    order = sorted(range(len(slots)), key=lambda i: len(_SLOT_ELIG.get(slots[i], (slots[i],))))
+    used, assign = set(), {}
+    for i in order:
+        elig = _SLOT_ELIG.get(slots[i], (slots[i],))
+        best, bv = None, -1e9
+        for j, p in enumerate(players):
+            if j in used or (p.get("pos") or "").upper() not in elig:
+                continue
+            v = p.get(key) or 0
+            if v > bv:
+                best, bv = j, v
+        if best is not None:
+            used.add(best)
+            assign[i] = players[best]
+    return [(slots[i], assign.get(i)) for i in range(len(slots))]
+
+
+def vegas_lineup(team, slots, dk, nfl):
+    """Optimal lineup using Vegas-implied points for games yet to start
+    (DraftKings props), live projection for games in progress, and actual
+    points for finished games. Falls back to the site projection where no
+    props are posted."""
+    _dk_enrich_team(team, dk)
+    pool = []
+    for p in (team.get("players") or []) + (team.get("bench") or []):
+        if not p.get("name") or p["name"] == "(empty)":
+            continue
+        st = p.get("game_status")
+        v = p.get("vegas") or {}
+        if st == "post":
+            exp, src = p.get("points") or 0, "final"
+        elif st == "in":
+            exp, src = (p.get("proj_live") if p.get("proj_live") is not None else p.get("points") or 0), "live"
+        elif v.get("fp") is not None:
+            exp, src = v["fp"], "vegas"
+        else:
+            exp, src = (p.get("projected") or 0), "proj"
+        if (p.get("injury") or "") in ("O", "IR", "SUS", "PUP", "COV", "NA", "DNR") and st != "post":
+            exp, src = 0, "out"
+        q = dict(p)
+        q["exp"], q["exp_src"] = round(float(exp), 1), src
+        q["vegas_lines"] = {k: v.get(k) for k in ("pass", "rush", "rec", "td")} if v else None
+        pool.append(q)
+    slots = [s for s in (slots or []) if s]
+    if not slots:
+        slots = [(p.get("slot") or p.get("pos") or "").upper() for p in team.get("players") or []]
+    by_key = {pkey_of(p): p for p in pool}
+    current = [(p.get("slot") or p.get("pos"), by_key.get(pkey_of(p)))
+               for p in (team.get("players") or []) if p.get("name") and p["name"] != "(empty)"]
+    optimal = _best_lineup(pool, slots, "exp")
+    cur_set = {pkey_of(p) for _, p in current if p}
+    opt_set = {pkey_of(p) for _, p in optimal if p}
+    strip = lambda p: None if p is None else {k: p.get(k) for k in (
+        "name", "pos", "team", "slot", "exp", "exp_src", "vegas_lines", "projected", "points", "proj_live",
+        "game_status", "game_detail", "opp", "opp_ha", "injury", "sleeper_id", "espn_id", "value")}
+    return {
+        "team": team.get("name"),
+        "slots": slots,
+        "current": [{"slot": s, "player": strip(p)} for s, p in current],
+        "optimal": [{"slot": s, "player": strip(p)} for s, p in optimal],
+        "current_total": round(sum((p or {}).get("exp") or 0 for _, p in current), 1),
+        "optimal_total": round(sum((p or {}).get("exp") or 0 for _, p in optimal), 1),
+        "start": [strip(p) for _, p in optimal if p and pkey_of(p) not in cur_set],
+        "sit": [strip(p) for _, p in current if p and pkey_of(p) not in opt_set],
+        "vegas_count": sum(1 for p in pool if p["exp_src"] == "vegas"),
+        "ts": int(time.time()),
+    }
+
+
+def pkey_of(p):
+    return str(p.get("sleeper_id") or p.get("espn_id") or p.get("name"))
+
+
+# --------------------------------------------------------------------------
+# Season position ranks (by total points and by points per game)
+# --------------------------------------------------------------------------
+_POS_RANKS = {"season": None, "ts": 0, "data": {}}
+
+
+def season_pos_ranks(season):
+    """{sleeper_id: {pos, total_rank, total_pts, ppg_rank, ppg, gp, n}} for the
+    season, PPR scoring. ppg rank counts anyone who has played a game, so an
+    injured star still shows where he stands per game."""
+    now = time.time()
+    if _POS_RANKS["season"] == str(season) and now - _POS_RANKS["ts"] < 600 and _POS_RANKS["data"]:
+        return _POS_RANKS["data"]
+    stats = season_stats(season)
+    pdb = sleeper_players()
+    by_pos = {}
+    for sid, s in stats.items():
+        meta = pdb.get(sid) or {}
+        pos = "DEF" if pos_is_def(meta) or (not meta and not sid.isdigit()) else meta.get("position")
+        if pos not in ("QB", "RB", "WR", "TE", "K", "DEF"):
+            continue
+        pts = s.get("pts_ppr") or 0
+        gp = int(s.get("gp") or 0)
+        by_pos.setdefault(pos, []).append((sid, round(pts, 1), gp))
+    out = {}
+    for pos, rows in by_pos.items():
+        rows = [r for r in rows if r[1] > 0 or r[2] > 0]
+        tot = sorted(rows, key=lambda r: -r[1])
+        avg = sorted((r for r in rows if r[2] > 0), key=lambda r: -(r[1] / r[2]))
+        total_rank = {sid: i + 1 for i, (sid, _, _) in enumerate(tot)}
+        ppg_rank = {sid: i + 1 for i, (sid, _, _) in enumerate(avg)}
+        for sid, pts, gp in rows:
+            out[sid] = {"pos": pos, "total_rank": total_rank.get(sid), "total_pts": pts,
+                        "ppg_rank": ppg_rank.get(sid), "ppg": round(pts / gp, 1) if gp else None,
+                        "gp": gp, "n": len(tot), "n_ppg": len(avg), "season": str(season)}
+    _POS_RANKS.update(season=str(season), ts=now, data=out)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Missed games: fill DNP rows into a game log from the team's schedule
+# --------------------------------------------------------------------------
+_SCHED_CACHE = {}
+
+
+def team_schedule(team, season):
+    """Completed regular-season games for a team: {week: {opp, atVs, result, score}}."""
+    team = canon_team(team)
+    key = (team, str(season))
+    now = time.time()
+    c = _SCHED_CACHE.get(key)
+    cur = str(season) == str(sleeper_state().get("season"))
+    if c and now - c["ts"] < (1800 if cur else 86400):
+        return c["data"]
+    code = {"WAS": "wsh"}.get(team, team).lower()
+    out = {}
+    try:
+        sch = _get_json("https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/"
+                        f"{code}/schedule?season={season}", timeout=20)
+        for ev in sch.get("events") or []:
+            if ((ev.get("seasonType") or {}).get("type") or 2) != 2:
+                continue
+            wk = (ev.get("week") or {}).get("number")
+            comp = (ev.get("competitions") or [{}])[0]
+            st = (comp.get("status") or {}).get("type") or {}
+            if wk is None or not st.get("completed"):
+                continue
+            me = opp = None
+            for x in comp.get("competitors") or []:
+                ab = canon_team((x.get("team") or {}).get("abbreviation"))
+                if ab == team:
+                    me = x
+                else:
+                    opp = x
+            if not me or not opp:
+                continue
+            sc = lambda x: (x.get("score") or {}).get("displayValue") if isinstance(x.get("score"), dict) else x.get("score")
+            res = "W" if me.get("winner") else ("L" if opp.get("winner") else "T")
+            out[int(wk)] = {"opp": canon_team((opp.get("team") or {}).get("abbreviation")),
+                            "atVs": "@" if me.get("homeAway") == "away" else "vs",
+                            "result": res, "score": f"{sc(me)}-{sc(opp)}"}
+    except Exception as e:
+        print(f"[schedule] {team} {season} failed: {e}")
+        if c:
+            return c["data"]
+    _SCHED_CACHE[key] = {"ts": now, "data": out}
+    return out
+
+
+def _fill_missed_games(gl, season, fallback_team):
+    """Add zero rows (dnp=True) for completed team games the player has no
+    row for. The player's team per week is taken from the nearest logged game,
+    so mid-season trades don't create phantom misses."""
+    rows = [r for r in gl.get("rows") or [] if not r.get("playoff")]
+    cols = gl.get("columns") or []
+    if not season or not cols:
+        return gl
+    week_team = {r["week"]: canon_team(r.get("team")) for r in rows
+                 if isinstance(r.get("week"), int) and r.get("team")}
+    played = {r["week"] for r in rows if isinstance(r.get("week"), int)}
+    fallback_team = canon_team(fallback_team)
+    teams = set(week_team.values()) | ({fallback_team} if fallback_team else set())
+    if not teams:
+        return gl
+    sched = {t: team_schedule(t, season) for t in teams}
+    all_weeks = sorted({w for s in sched.values() for w in s})
+
+    def team_for(w):
+        if not week_team:
+            return fallback_team
+        before = [k for k in week_team if k <= w]
+        after = [k for k in week_team if k > w]
+        return week_team[max(before)] if before else week_team[min(after)]
+
+    added = []
+    for w in all_weeks:
+        if w in played:
+            continue
+        t = team_for(w)
+        g = (sched.get(t) or {}).get(w)
+        if not g:
+            continue
+        added.append({"week": w, "date": None, "atVs": g["atVs"], "opp": g["opp"],
+                      "opp_logo": _logo_url(g["opp"]), "result": g["result"], "score": g["score"],
+                      "fpts": 0.0, "values": [0] * len(cols), "playoff": False, "dnp": True, "team": t})
+    if added:
+        gl["rows"] = sorted((gl.get("rows") or []) + added,
+                            key=lambda r: (bool(r.get("playoff")), r["week"] if isinstance(r.get("week"), int) else 999))
+        gl["missed"] = len(added)
+    return gl

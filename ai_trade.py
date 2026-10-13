@@ -116,12 +116,27 @@ def _pline(p):
         bits.append(f"{p['ppg']} ppg over {p.get('gp')} gms")
     if p.get("snap_pct") is not None:
         bits.append(f"{p['snap_pct']}% snaps")
+    if p.get("season_line"):
+        bits.append(p["season_line"])
     if p.get("projected") is not None:
         bits.append(f"this wk proj {p['projected']}")
+    if p.get("points"):
+        bits.append(f"this wk so far {p['points']}")
+    v = p.get("vegas")
+    if v:
+        vb = [f"{k} yds O/U {v[k]}" for k in ("pass", "rush", "rec") if v.get(k)]
+        if v.get("td"):
+            vb.append(f"anytime TD {v['td']}")
+        if v.get("fp"):
+            vb.append(f"≈{v['fp']} Vegas-implied fp")
+        if vb:
+            bits.append("Vegas: " + ", ".join(vb))
     if p.get("injury"):
-        bits.append(f"INJURY {p['injury']}")
+        bits.append(f"INJURY {p['injury']}" + (f" ({p['injury_note']})" if p.get("injury_note") else ""))
     if p.get("bye"):
         bits.append(f"bye wk {p['bye']}")
+    if p.get("age"):
+        bits.append(f"age {p['age']}" + (f", yr {p['exp']}" if p.get("exp") is not None else ""))
     return " | ".join(bits)
 
 
@@ -269,7 +284,99 @@ def _find_players(team, wanted):
     return out
 
 
-def build_dossier(rosters, lab, a_id, b_id, give, get, mode, prefs):
+def _fmt_when(ms):
+    try:
+        return time.strftime("%b %d", time.localtime(int(ms) / 1000))
+    except Exception:
+        return ""
+
+
+def _trades_section(trades):
+    if trades is None:
+        return "## League trade history\n  (unavailable right now)"
+    if not trades:
+        return "## League trade history\n  No completed trades in this league this season."
+    lines = ["## League trade history (most recent first, completed trades only)"]
+    for tr in trades:
+        sides = []
+        for s in tr.get("sides") or []:
+            got = ", ".join(f"{p['name']} ({p.get('pos') or '?'})" for p in s.get("gets") or [])
+            if s.get("picks"):
+                got += (", " if got else "") + "picks " + ", ".join(s["picks"])
+            sides.append(f"{s['team']} received {got or 'nothing'}")
+        lines.append(f"  Week {tr.get('week')} ({_fmt_when(tr.get('when'))}): " + " | ".join(sides))
+    return "\n".join(lines)
+
+
+def _lab_sections(lab, teams, A):
+    if not lab:
+        return []
+    out = []
+    mw = lab.get("matchups_week") or []
+    if mw:
+        score = {t["name"]: t for t in teams}
+        rows = []
+        for m in mw:
+            a, b = score.get(m["a"], {}), score.get(m["b"], {})
+            rows.append(f"  {m['a']} ({a.get('score', 0)} pts, proj {a.get('projected')}) vs "
+                        f"{m['b']} ({b.get('score', 0)} pts, proj {b.get('projected')})")
+        out.append(f"## This week's matchups (week {lab.get('week')}, live scores so far)\n" + "\n".join(rows))
+    rem = lab.get("remaining") or {}
+    if rem:
+        out.append("## Remaining regular-season schedule\n"
+                   + "\n".join(f"  {n}: {', '.join(v) or 'none left'}" for n, v in rem.items()))
+    pw = lab.get("power") or []
+    if pw:
+        out.append("## Power rankings (roster strength by total trade value; movement vs last week)\n"
+                   + "\n".join(f"  #{p['rank']} {p['name']}{' (YOU)' if p.get('is_me') else ''} — {p.get('record')}, "
+                               f"value {p.get('value_total')}, move {'+' if (p.get('movement') or 0) > 0 else ''}{p.get('movement') or 0}"
+                               for p in pw))
+    rc = lab.get("recap")
+    if rc:
+        gm = lambda g: f"{g['a']} {g['as']} – {g['bs']} {g['b']} (by {g['margin']})" if g else "–"
+        out.append(f"## Last completed week recap\n  Top score: {rc['top']['name']} {rc['top']['score']}; "
+                   f"low: {rc['low']['name']} {rc['low']['score']}; blowout: {gm(rc.get('blowout'))}; closest: {gm(rc.get('closest'))}")
+    wv = lab.get("waivers") or []
+    if wv:
+        out.append("## Best available free agents / waivers (unrostered, by value; 🔥 = trending add)\n"
+                   + "\n".join(f"  {w['name']} ({w.get('pos')}, {w.get('team') or 'FA'}) value {w.get('value')}"
+                               f"{' 🔥' if w.get('hot') else ''}{' 30d ' + ('+' if w['trend'] > 0 else '') + str(w['trend']) if w.get('trend') else ''}"
+                               for w in wv[:25]))
+    bs = lab.get("buysell") or {}
+    if bs.get("sell") or bs.get("buy"):
+        f = lambda arr: "\n".join(f"  {p['name']} ({p.get('pos')}, owned by {p.get('owner')}) value {p.get('value')}, 30d {'+' if (p.get('trend') or 0) > 0 else ''}{p.get('trend')}" for p in arr)
+        out.append("## Market trends\nSELL HIGH (rising fastest):\n" + (f(bs.get("sell") or []) or "  –")
+                   + "\nBUY LOW (falling fastest):\n" + (f(bs.get("buy") or []) or "  –"))
+    ve = lab.get("vegas_edge") or {}
+    if ve.get("over") or ve.get("under"):
+        f = lambda arr: "\n".join(f"  {p['name']} ({p.get('pos')}, {p.get('owner')}): proj {p.get('proj')}, Vegas-implied {p.get('vegas_fp')}, edge {'+' if (p.get('edge') or 0) > 0 else ''}{p.get('edge')}" for p in arr)
+        out.append("## Vegas vs projection this week (DraftKings-implied fantasy points)\nVegas higher than projection:\n"
+                   + (f(ve.get("over") or []) or "  –") + "\nVegas lower than projection:\n" + (f(ve.get("under") or []) or "  –"))
+    by = lab.get("byes") or []
+    if by:
+        out.append(f"## {A['name']}'s upcoming bye weeks\n" + "\n".join(
+            f"  Week {b['week']}: " + ", ".join(f"{p['name']} ({p.get('pos')}{', starter' if p.get('starter') else ''})" for p in b["players"]) for b in by))
+    return out
+
+
+def _mentioned_players(text, teams):
+    """Players whose name (or unique last name) appears in a free-form question."""
+    t = (text or "").lower()
+    if not t:
+        return []
+    hits = []
+    for tm in teams:
+        for p in _all(tm):
+            nm = (p.get("name") or "").lower()
+            if not nm:
+                continue
+            last = nm.split()[-1]
+            if nm in t or (len(last) > 3 and re.search(r"\b" + re.escape(last) + r"\b", t)):
+                hits.append(p)
+    return hits
+
+
+def build_dossier(rosters, lab, a_id, b_id, give, get, mode, prefs, trades=None, question=None):
     teams = rosters.get("teams") or []
     by_id = {str(t.get("id")): t for t in teams}
     A = by_id.get(str(a_id)) or next((t for t in teams if t.get("is_me")), teams[0])
@@ -286,27 +393,35 @@ def build_dossier(rosters, lab, a_id, b_id, give, get, mode, prefs):
             f"{sc.get('playoff_teams')} playoff teams, playoffs start week {sc.get('playoff_start')}.",
             f"Lineup slots: {', '.join(rosters.get('slots') or [])}",
             "Trade values are FantasyCalc market values (higher = better; roughly linear). "
-            "ppg = season fantasy points per game in this league's scoring format."]
+            "ppg = season fantasy points per game in this league's scoring format; "
+            "'30d' = 30-day value trend; Vegas lines are DraftKings props for this week."]
 
     stand = []
     for r in ((lab or {}).get("teams") or []):
         stand.append(f"  {r.get('name')}{' (YOU)' if r.get('is_me') else ''}: {r.get('wins')}-{r.get('losses')}"
-                     f"{'-' + str(r['ties']) if r.get('ties') else ''}, PF {r.get('pf')}, "
-                     f"strength #{r.get('strength_rank')}, playoff {r.get('playoff_pct')}%")
+                     f"{'-' + str(r['ties']) if r.get('ties') else ''}, PF {r.get('pf')}, PA {r.get('pa')}, "
+                     f"strength #{r.get('strength_rank')}, playoff odds {r.get('playoff_pct')}%")
     if not stand:
         for t in sorted(teams, key=lambda x: (-(x.get('wins') or 0), -(x.get('pf') or 0))):
             stand.append(f"  {t['name']}{' (YOU)' if t.get('is_me') else ''}: {t.get('record')}, "
-                         f"PF {t.get('pf')}, strength #{t.get('strength_rank')}")
+                         f"PF {t.get('pf')}, PA {t.get('pa')}, strength #{t.get('strength_rank')}")
     sos = {s["name"]: s for s in ((lab or {}).get("sos") or [])}
 
     parts = ["\n".join(head), "## Standings\n" + "\n".join(stand)]
     if sos:
         parts.append("## Remaining schedule difficulty (avg opponent roster value, lower = easier)\n"
                      + "\n".join(f"  {n}: {s.get('opp_value')} over {s.get('games')} games" for n, s in sos.items()))
+    parts += _lab_sections(lab, teams, A)
+    parts.append(_trades_section(trades))
 
     parts.append(_team_block("Team A", A, teams, lab_rows.get(A["name"]), full=True))
     if B is not None:
         parts.append(_team_block("Team B", B, teams, lab_rows.get(B["name"]), full=True))
+    others = [t for t in teams if t is not A and t is not B]
+    if others:
+        parts.append("## Every other team in the league (rosters by value)")
+        for t in others:
+            parts.append(_team_block("Team", t, teams, lab_rows.get(t["name"]), full=(mode != "evaluate" and B is None)))
 
     involved = []
     if mode == "evaluate":
@@ -316,25 +431,21 @@ def build_dossier(rosters, lab, a_id, b_id, give, get, mode, prefs):
                      f"Team B ({B['name'] if B else '?'}) sends: " + (", ".join(p['name'] for p in get_p) or "nothing"))
         involved = give_p + get_p
     else:
-        others = [t for t in teams if t is not A and (B is None or t is B)]
-        if others:
-            parts.append("## Other teams" + (" (potential partners)" if B is None else ""))
-            for t in others:
-                parts.append(_team_block("Team", t, teams, lab_rows.get(t["name"]), full=(t is B)))
-        # deep-dive on A's most valuable + any explicitly selected players
-        sel = _find_players(A, give)
+        sel = _find_players(A, give) + (_find_players(B, get) if B else [])
+        mentioned = _mentioned_players(question, teams) if mode == "ask" else []
+        block = [p for p in _all(A) if p.get("name") in set(prefs.get("block") or [])]
         tops = sorted(_all(A), key=lambda p: -(p.get("value") or 0))[:4]
         seen = set()
-        for p in sel + tops:
+        for p in sel + mentioned + block + tops:
             if id(p) not in seen:
                 seen.add(id(p))
                 involved.append(p)
-        involved = involved[:6]
+    involved = involved[:10]
 
     if involved:
-        with ThreadPoolExecutor(max_workers=4) as ex:
+        with ThreadPoolExecutor(max_workers=5) as ex:
             dossiers = list(ex.map(lambda p: _safe_dossier(p, season), involved))
-        parts.append("## Player intel (news, outlook, Vegas, recent form)\n" + "\n".join(d for d in dossiers if d))
+        parts.append("## Player intel (news, season outlook, Vegas props, recent games)\n" + "\n".join(d for d in dossiers if d))
 
     pref_lines = []
     if prefs.get("want"):
@@ -367,8 +478,22 @@ SYSTEM = (
     "You reason like an experienced league-winner: starting-lineup impact beats raw value sums, "
     "2-for-1s that consolidate value usually favor the side getting the best player, "
     "roster construction and bye weeks matter, injuries and news change value fast, "
-    "contenders should trade future value for current production and rebuilders the reverse. "
-    "Use ONLY the data provided; do not invent stats. Be specific and concise. "
+    "contenders should trade future value for current production and rebuilders the reverse.\n\n"
+    "The LEAGUE DATA below is everything the app knows, and you must use EVERY piece of it that is "
+    "relevant -- read all sections before answering. It contains: league format and lineup slots; "
+    "standings with points for/against, roster-strength rank and simulated playoff odds; remaining "
+    "schedule difficulty and each team's remaining opponents; this week's matchups with live scores; "
+    "power rankings with week-over-week movement; last week's recap; the best available free agents "
+    "and trending adds; buy-low / sell-high market trends; Vegas-vs-projection edges; Team A's upcoming "
+    "byes; the league's completed trade history; every team's full roster with trade value, positional "
+    "rank, 30-day trend, points per game, snap share, season usage, this-week projection and points so "
+    "far, Vegas props, injuries with notes, bye week and age; each team's positional needs/surplus; and, "
+    "for the key players, news, season outlook, Vegas props and recent game-by-game scores. "
+    "When the manager asks about something, answer from the matching section (e.g. trade history -> "
+    "'League trade history'; who is free -> 'Best available free agents'; a team's schedule -> "
+    "'Remaining regular-season schedule'). Never say information is unavailable if it appears in the "
+    "data; if a section is genuinely missing or empty, say exactly that. Cite the specific numbers you "
+    "relied on. Use ONLY the data provided; do not invent stats. Be specific and concise. "
     "Always answer with a single JSON object and nothing else -- no prose outside the JSON."
 )
 
@@ -410,7 +535,20 @@ Give 3-5 proposals, best first, across different partners where sensible. Only u
 }
 
 
-def _user_prompt(mode, dossier, question):
+def _conversation(history):
+    turns = [h for h in (history or []) if isinstance(h, dict) and h.get("text")][-10:]
+    if not turns:
+        return ""
+    lines = []
+    for h in turns:
+        who = "Manager" if h.get("role") == "user" else "Analyst"
+        lines.append(f"{who}: {str(h['text']).strip()[:1800]}")
+    return ("Conversation so far between the manager and you (the Analyst). Keep continuity with it -- "
+            "refer back to earlier answers, players and proposals when the manager does:\n"
+            + "\n".join(lines) + "\n\n")
+
+
+def _user_prompt(mode, dossier, question, history=None):
     if mode == "evaluate":
         task = ("Evaluate the proposed trade for Team A. Weigh starting-lineup impact (this week and rest of season), "
                 "depth, positional need, playoff position, injuries/news, Vegas usage signals and market value. "
@@ -419,7 +557,9 @@ def _user_prompt(mode, dossier, question):
         task = ("Find the best realistic trades Team A can make in this league right now, respecting the manager "
                 "preferences. Target partners whose needs match A's surplus. Prefer deals that upgrade A's starting lineup.")
     else:
-        task = "Answer the manager's question using the league data. Question: " + (question or "").strip()[:1200]
+        task = (_conversation(history)
+                + "Answer the manager's latest message using the league data (and the conversation above). "
+                  "Latest message: " + (question or "").strip()[:1500])
     return (f"{task}\n\nRespond with JSON exactly in this shape:\n{SCHEMAS[mode]}\n\n"
             f"=== LEAGUE DATA ===\n{dossier}")
 
@@ -492,9 +632,8 @@ def _call_claude_cli(s, system, user):
         if "authenticate" in msg.lower() or "login" in msg.lower() or "oauth" in msg.lower():
             msg += "  → Open a terminal, run `claude`, and sign in with your Claude account, then retry."
         raise RuntimeError(f"Claude CLI: {msg[:400]}")
-    u = j.get("usage") or {}
-    return text, {"in": u.get("input_tokens"), "out": u.get("output_tokens"),
-                  "cost_usd": j.get("total_cost_usd")}
+    # usage/cost figures from the CLI aren't meaningful on an account login
+    return text, {}
 
 
 def _call_codex_cli(s, system, user):
@@ -579,7 +718,7 @@ def _parse_json(text):
 # --------------------------------------------------------------------------
 # entry point
 # --------------------------------------------------------------------------
-def analyze(cfg, rosters, lab, req):
+def analyze(cfg, rosters, lab, req, trades=None):
     s = settings_from(cfg)
     mode = req.get("mode") or "evaluate"
     if mode not in SCHEMAS:
@@ -587,8 +726,9 @@ def analyze(cfg, rosters, lab, req):
     t0 = time.time()
     dossier, A, B = build_dossier(rosters, lab, req.get("a_id"), req.get("b_id"),
                                   req.get("give") or [], req.get("get") or [], mode,
-                                  req.get("prefs") or {})
-    text, usage = _call_llm(s, SYSTEM, _user_prompt(mode, dossier, req.get("question")))
+                                  req.get("prefs") or {}, trades=trades,
+                                  question=req.get("question"))
+    text, usage = _call_llm(s, SYSTEM, _user_prompt(mode, dossier, req.get("question"), req.get("history")))
     try:
         result = _parse_json(text)
     except Exception:
@@ -598,4 +738,4 @@ def analyze(cfg, rosters, lab, req):
             "provider": s["provider"], "model": s["model"], "usage": usage,
             "a": A.get("name"), "b": B.get("name") if B else None,
             "secs": round(time.time() - t0, 1),
-            "dossier_chars": len(dossier)}
+            "dossier": dossier}

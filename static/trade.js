@@ -126,7 +126,6 @@ window.TradeView = (function () {
     if (leagueId !== T.leagueId) {
       T.leagueId = leagueId; T.data = null; T.teams = []; avgCache = null;
       T.selA = new Set(); T.selB = new Set(); T.finder = null; T.history = null; T.histErr = null;
-      T.ai.res = null; T.ai.err = null; T.ai.busy = false;
       T.block = new Set(store.get("block:" + leagueId, []));
       T.untouch = new Set(store.get("untouch:" + leagueId, []));
       T.saved = store.get("saved:" + leagueId, []);
@@ -167,12 +166,6 @@ window.TradeView = (function () {
       <div class="vhead">
         <div class="vtitle">⇄ Trade Center <small>${esc(d.league_name)} · Wk ${d.week}</small></div>
         <div class="vactions">
-          <div class="seg" id="tcTabs">
-            <button data-tab="finder" class="${T.tab === "finder" ? "active" : ""}">🔍 Finder</button>
-            <button data-tab="ai" class="ai ${T.tab === "ai" ? "active" : ""}">🤖 AI Analyst</button>
-            <button data-tab="history" class="${T.tab === "history" ? "active" : ""}">📜 History</button>
-            <button data-tab="saved" class="${T.tab === "saved" ? "active" : ""}">💾 Saved${T.saved.length ? ` (${T.saved.length})` : ""}</button>
-          </div>
           <button class="ghost" id="tcRefresh">↻ Refresh</button>
         </div>
       </div>
@@ -181,6 +174,14 @@ window.TradeView = (function () {
         <div class="tc-main">
           <div class="tc-sides"><div class="panel" id="tcA"></div><div class="panel" id="tcB"></div></div>
           <div class="panel deal" id="tcDeal"></div>
+          <div class="tc-tabs">
+            <div class="seg" id="tcTabs">
+              <button data-tab="finder" class="${T.tab === "finder" ? "active" : ""}">🔍 Finder</button>
+              <button data-tab="ai" class="ai ${T.tab === "ai" ? "active" : ""}">🤖 AI Analyst</button>
+              <button data-tab="history" class="${T.tab === "history" ? "active" : ""}">📜 History</button>
+              <button data-tab="saved" class="${T.tab === "saved" ? "active" : ""}">💾 Saved${T.saved.length ? ` (${T.saved.length})` : ""}</button>
+            </div>
+          </div>
           <div id="tcBottom"></div>
         </div>
       </div></div>`;
@@ -212,13 +213,20 @@ window.TradeView = (function () {
             ${tags.has.map(p => `<span class="mini has ${posClass(p)}">deep ${p}</span>`).join("")}</div>
         </button>`;
     }).join("");
-    host.querySelectorAll(".partner").forEach(b => b.addEventListener("click", () => {
+    host.onclick = e => {
+      const b = e.target.closest(".partner"); if (!b) return;
       const i = parseInt(b.dataset.i, 10);
-      if (i === meIdx()) { if (T.aIdx !== i) { T.aIdx = i; T.selA = new Set(); renderSide("a"); renderDeal(); } return; }
+      if (i === meIdx()) { if (T.aIdx !== i) { T.aIdx = i; T.selA = new Set(); renderSide("a"); teamsChanged(); } return; }
       if (i === T.aIdx) { T.aIdx = meIdx(); T.selA = new Set(); renderSide("a"); }
       T.bIdx = i; T.selB = new Set();
-      renderRail(); renderSide("b"); renderDeal();
-    }));
+      renderRail(); renderSide("b"); teamsChanged();
+    };
+  }
+  // after A or B changes: redo the deal board and the bottom panel (finder /
+  // AI labels name the partner); partner-specific finder results are stale
+  function teamsChanged() {
+    if (T.finder && T.finder.kind === "with") T.finder = null;
+    renderDeal(); renderBottom();
   }
 
   /* ---------------- roster sides ---------------- */
@@ -272,7 +280,7 @@ window.TradeView = (function () {
       const i = parseInt(e.target.value, 10);
       if (side === "a") { T.aIdx = i; T.selA = new Set(); if (T.bIdx === i) { T.bIdx = T.teams.findIndex((x, j) => j !== i); T.selB = new Set(); renderSide("b"); } }
       else { T.bIdx = i; T.selB = new Set(); if (T.aIdx === i) { T.aIdx = meIdx() === i ? T.teams.findIndex((x, j) => j !== i) : meIdx(); T.selA = new Set(); renderSide("a"); } }
-      renderSide(side); renderRail(); renderDeal();
+      renderSide(side); renderRail(); teamsChanged();
     });
     host.querySelectorAll(".tp").forEach(row => row.addEventListener("click", e => {
       if (e.target.closest(".pm-open")) return;
@@ -501,77 +509,137 @@ window.TradeView = (function () {
   }
 
   /* ---- AI analyst ---- */
-  function aiStatusChanged(s) { T.ai.status = s; if (T.tab === "ai" && T.host) renderBottom(); }
+  // Results and chats live per league in module state (and the chat in
+  // localStorage), so switching views or leagues never loses them, and a
+  // request that is in flight lands in the right league when it finishes.
+  const AI = { results: {}, chats: {}, pending: null, status: null };
+  const chatFor = id => { if (!AI.chats[id]) AI.chats[id] = store.get("aichat:" + id, []); return AI.chats[id]; };
+  const saveChat = id => store.set("aichat:" + id, chatFor(id).slice(-40));
+  const resFor = (id, mode) => (AI.results[id] || {})[mode];
+  function setRes(id, mode, res, err) { (AI.results[id] = AI.results[id] || {})[mode] = res; (AI.results[id].err = AI.results[id].err || {})[mode] = err || null; }
+  const errFor = (id, mode) => ((AI.results[id] || {}).err || {})[mode];
+  const isPending = (id, mode) => !!(AI.pending && AI.pending.id === id && AI.pending.mode === mode);
+
+  function aiStatusChanged(s) { AI.status = s; if (T.tab === "ai" && T.host) renderBottom(); }
   function renderAiPanel(host) {
     const A = team("a"), B = team("b");
     const give = selected("a"), get = selected("b");
-    const st = T.ai.status || aiStatus;
-    if (!st) { fetchAiStatus().then(s => { T.ai.status = s; if (T.tab === "ai") renderBottom(); }); }
+    const st = AI.status || aiStatus;
+    if (!st) { fetchAiStatus().then(s => { AI.status = s; if (T.tab === "ai") renderBottom(); }); }
     const provLabel = st ? ((st.providers || {})[st.provider] || {}).label || st.provider : "…";
     const ready = st ? st.configured : true;
-    const m = T.ai.mode;
+    const m = T.ai.mode, id = T.leagueId;
+    const busy = isPending(id, m);
     const dealLine = give.length || get.length
       ? `<b>${esc(A.name)}</b> sends ${give.map(p => esc(p.name)).join(", ") || "—"} ⇄ <b>${esc(B.name)}</b> sends ${get.map(p => esc(p.name)).join(", ") || "—"}`
       : `Nothing on the board yet — pick players above, or use <i>Suggest trades</i>.`;
+    const pendingElsewhere = AI.pending && !busy ? `<span class="pt-lbl">· ${esc(AI.pending.mode)} running${AI.pending.id !== id ? " in another league" : ""}…</span>` : "";
     host.innerHTML = `<div class="panel ai-panel">
-      <div class="panel-h"><span>🤖 AI analyst</span>
+      <div class="panel-h"><span>🤖 AI analyst ${pendingElsewhere}</span>
         <span class="ai-meta">${st ? esc(provLabel) + (st.model ? " · " + esc(st.model) : "") : ""} ${st && !ready ? `· <b style="color:var(--lose)">not set up</b>` : ""}
           <button class="ghost" id="aiSettings">⚙ ${ready ? "change" : "set up"}</button></span></div>
       <div class="ai-body">
         <div class="seg ai-modes">
           <button data-m="evaluate" class="${m === "evaluate" ? "active ai" : ""}">Evaluate this deal</button>
           <button data-m="suggest" class="${m === "suggest" ? "active ai" : ""}">Suggest trades for me</button>
-          <button data-m="ask" class="${m === "ask" ? "active ai" : ""}">Ask the analyst</button>
+          <button data-m="ask" class="${m === "ask" ? "active ai" : ""}">Ask the analyst${chatFor(id).length ? ` (${Math.ceil(chatFor(id).length / 2)})` : ""}</button>
         </div>
-        <div class="ai-ctrls" style="margin-top:10px">
-          ${m === "evaluate" ? `<span class="fnote" style="flex:1">${dealLine}</span><button class="primary ai" id="aiRun" ${(!give.length && !get.length) || T.ai.busy ? "disabled" : ""}>Analyze</button>` : ""}
+        ${m !== "ask" ? `<div class="ai-ctrls" style="margin-top:10px">
+          ${m === "evaluate" ? `<span class="fnote" style="flex:1">${dealLine}</span><button class="primary ai" id="aiRun" ${(!give.length && !get.length) || busy ? "disabled" : ""}>Analyze</button>` : ""}
           ${m === "suggest" ? `<textarea id="aiNotes" placeholder="Optional notes for the analyst — e.g. “I'm a contender, need an RB2, won't move my QB, open to 2-for-1s.”">${esc(T.ai.notes)}</textarea>
              <label class="need-ctrl"><input type="checkbox" id="aiPartnerOnly" ${T.ai.partnerOnly ? "checked" : ""}> only with ${esc(B.name)}</label>
-             <button class="primary ai" id="aiRun" ${T.ai.busy ? "disabled" : ""}>Find trades</button>` : ""}
-          ${m === "ask" ? `<textarea id="aiQ" placeholder="Ask anything about this league — “Who should I target for a WR2?”, “Is my RB room good enough to win?”, “Which of my bench guys has the most trade value?”">${esc(T.ai.question)}</textarea>
-             <button class="primary ai" id="aiRun" ${T.ai.busy ? "disabled" : ""}>Ask</button>` : ""}
+             <button class="primary ai" id="aiRun" ${busy ? "disabled" : ""}>Find trades</button>` : ""}
         </div>
-        <div class="fnote" style="margin-top:8px">The analyst gets this league's settings, standings &amp; playoff odds, both rosters with values, season stats, injuries and byes, plus news, outlooks, Vegas lines and recent games for the players involved. It uses your ★ block, 🔒 untouchables and the Finder's position filters as preferences.</div>
-        <div id="aiStatusLine" class="ai-status" ${T.ai.busy ? "" : "hidden"}><span class="spin"></span>Gathering rosters, news, odds and standings, then asking ${esc(provLabel)}… this can take 20–60 seconds.</div>
-        <div id="aiErr" class="ai-err" ${T.ai.err ? "" : "hidden"}>${esc(T.ai.err || "")}</div>
-        <div id="aiOut" class="ai-out"></div>
+        <div class="fnote" style="margin-top:8px">The analyst gets everything the app knows about this league: format, standings &amp; playoff odds, schedule &amp; this week's matchups, power rankings, trade history, waivers, buy/sell trends, Vegas edges, byes, every roster with values, season stats, usage, injuries and Vegas props, plus news, outlooks and recent games for the key players. It uses your ★ block, 🔒 untouchables and the Finder's position filters as preferences.</div>
+        <div class="ai-status" ${busy ? "" : "hidden"}><span class="spin"></span>Gathering rosters, news, odds and standings, then asking ${esc(provLabel)}… this can take 20–60 seconds. You can switch views — the result will be here when you come back.</div>
+        <div class="ai-err" ${errFor(id, m) ? "" : "hidden"}>${esc(errFor(id, m) || "")}</div>
+        <div id="aiOut" class="ai-out"></div>` : renderChat(id, busy, provLabel)}
       </div></div>`;
     host.querySelector("#aiSettings").addEventListener("click", openSettings);
     host.querySelectorAll(".ai-modes button").forEach(b => b.addEventListener("click", () => { T.ai.mode = b.dataset.m; renderBottom(); }));
     const notes = host.querySelector("#aiNotes"); if (notes) notes.addEventListener("input", () => T.ai.notes = notes.value);
-    const q = host.querySelector("#aiQ"); if (q) q.addEventListener("input", () => T.ai.question = q.value);
     const po = host.querySelector("#aiPartnerOnly"); if (po) po.addEventListener("change", () => T.ai.partnerOnly = po.checked);
     const run = host.querySelector("#aiRun"); if (run) run.addEventListener("click", () => runAi(T.ai.mode));
-    if (T.ai.res && T.ai.res.mode === m) renderAiResult(host.querySelector("#aiOut"), T.ai.res);
+    if (m === "ask") wireChat(host, id);
+    else if (resFor(id, m)) renderAiResult(host.querySelector("#aiOut"), resFor(id, m));
   }
+
+  /* chat thread for "Ask the analyst" */
+  function renderChat(id, busy, provLabel) {
+    const msgs = chatFor(id);
+    const bubble = (h, i) => h.role === "user"
+      ? `<div class="bubble user"><div class="bubble-text">${esc(h.text)}</div><div class="bubble-meta">${new Date(h.ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</div></div>`
+      : `<div class="bubble bot"><div class="bubble-text">${esc(h.text)}</div>
+          ${h.proposal && (h.proposal.give || h.proposal.get) ? `<div class="ai-prop" data-i="${i}"><div><div class="ai-prop-h">${esc(h.proposal.team || "")}</div><div class="ai-prop-deal">give <b>${(h.proposal.give || []).map(esc).join(" + ") || "—"}</b> ⇄ get <b>${(h.proposal.get || []).map(esc).join(" + ") || "—"}</b></div></div><button class="ghost load-prop">Load</button></div>` : ""}
+          <div class="bubble-meta">${esc(h.model || "")}${h.secs ? ` · ${h.secs}s` : ""} · ${new Date(h.ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}${h.dossier ? ` · <span class="see-data" data-i="${i}">what it saw</span>` : ""}</div></div>`;
+    return `<div class="chat" id="aiChat">
+        ${msgs.length ? msgs.map(bubble).join("") : `<div class="chat-empty">Ask anything about this league — “Who should I target for a WR2?”, “Is my RB room good enough to win?”, “What trades have happened?” — then keep going; the analyst remembers this conversation (saved in your browser) and re-reads the latest league data on every message.</div>`}
+        ${busy ? `<div class="bubble bot typing"><span class="spin"></span>Reading the league and thinking… (${esc(provLabel)}; you can switch views meanwhile)</div>` : ""}
+        ${errFor(id, "ask") ? `<div class="ai-err">${esc(errFor(id, "ask"))}</div>` : ""}
+      </div>
+      <div class="chat-input">
+        <textarea id="aiQ" placeholder="${msgs.length ? "Ask a follow-up… (Enter to send, Shift+Enter for a new line)" : "Ask the analyst… (Enter to send)"}">${esc(T.ai.question)}</textarea>
+        <div class="chat-btns"><button class="primary ai" id="aiRun" ${busy ? "disabled" : ""}>Send</button>
+          <button class="ghost" id="aiNew" ${msgs.length ? "" : "hidden"}>New chat</button></div>
+      </div>`;
+  }
+  function wireChat(host, id) {
+    const q = host.querySelector("#aiQ");
+    q.addEventListener("input", () => T.ai.question = q.value);
+    q.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); runAi("ask"); } });
+    const nb = host.querySelector("#aiNew");
+    if (nb) nb.addEventListener("click", () => { AI.chats[id] = []; saveChat(id); setRes(id, "ask", null, null); renderBottom(); });
+    host.querySelectorAll(".load-prop").forEach(b => b.addEventListener("click", () => {
+      const h = chatFor(id)[parseInt(b.closest(".ai-prop").dataset.i, 10)];
+      if (h && h.proposal) loadFromNames(h.proposal.team, h.proposal.give, h.proposal.get);
+    }));
+    host.querySelectorAll(".see-data").forEach(x => x.addEventListener("click", () => {
+      const h = chatFor(id)[parseInt(x.dataset.i, 10)];
+      if (h && h.dossier) openModal("What the analyst saw", `<pre class="dossier-pre">${esc(h.dossier)}</pre>`, "wide");
+    }));
+    const chat = host.querySelector("#aiChat"); if (chat) chat.scrollTop = chat.scrollHeight;
+    if (!isPending(id, "ask")) q.focus();
+  }
+
   async function runAi(mode) {
-    if (T.ai.busy) return;
-    const A = team("a"), B = team("b");
+    if (AI.pending) { toast("The analyst is still working on the previous request"); return; }
+    const A = team("a"), B = team("b"), id = T.leagueId;
+    const question = (T.ai.question || "").trim();
+    if (mode === "ask" && !question) return;
+    const history = mode === "ask" ? chatFor(id).map(h => ({ role: h.role, text: h.text })) : [];
     const body = {
-      id: T.leagueId, mode, a_id: A.id,
+      id, mode, a_id: A.id,
       b_id: (mode === "suggest" && !T.ai.partnerOnly) ? null : B.id,
       give: selected("a").map(ref), get: selected("b").map(ref),
-      question: T.ai.question,
+      question, history,
       prefs: { want: [...T.want], exclude: [...T.exclude], notes: T.ai.notes,
         block: allOf(A).filter(p => T.block.has(pkey(p))).map(p => p.name),
         untouchable: allOf(A).filter(p => T.untouch.has(pkey(p))).map(p => p.name) },
     };
-    T.ai.busy = true; T.ai.err = null; T.ai.res = null;
-    if (T.tab === "ai") renderBottom();
+    if (mode === "ask") { chatFor(id).push({ role: "user", text: question, ts: Date.now() }); saveChat(id); T.ai.question = ""; }
+    AI.pending = { id, mode }; setRes(id, mode, mode === "ask" ? resFor(id, mode) : null, null);
+    if (T.tab === "ai" && T.leagueId === id) renderBottom();
     try {
       const r = await fetch("/api/trade/ai", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const d = await r.json();
       if (d.error) throw new Error(d.error);
       if (!d.ok && d.result && d.result.error) throw new Error(d.result.error + (d.result.raw ? "\n\n" + d.result.raw.slice(0, 400) : ""));
-      T.ai.res = d;
-    } catch (e) { T.ai.err = String(e.message || e); }
-    T.ai.busy = false;
-    if (T.tab === "ai") renderBottom();
+      if (mode === "ask") {
+        const res = d.result || {};
+        chatFor(id).push({ role: "assistant", text: res.answer || "", proposal: res.proposal || null, model: d.model, secs: d.secs, ts: Date.now(), dossier: d.dossier });
+        saveChat(id); setRes(id, mode, d, null);
+      } else setRes(id, mode, d, null);
+    } catch (e) { setRes(id, mode, resFor(id, mode), String(e.message || e)); }
+    AI.pending = null;
+    if (T.host && T.tab === "ai" && T.leagueId === id) renderBottom();
+    else if (T.host && T.tab === "ai") renderBottom();
+    toast(mode === "ask" ? "The analyst replied" : `AI ${mode} finished`);
   }
   function renderAiResult(host, d) {
     if (!host) return;
     const r = d.result || {};
-    const meta = `<div class="ai-meta">${esc(d.provider || "")}${d.model ? " · " + esc(d.model) : ""} · ${d.secs}s${d.usage && d.usage.in ? ` · ${d.usage.in}→${d.usage.out} tokens` : ""}${d.usage && d.usage.cost_usd != null ? ` · $${Number(d.usage.cost_usd).toFixed(3)}` : ""}</div>`;
+    const meta = `<div class="ai-meta">${esc(d.provider || "")}${d.model ? " · " + esc(d.model) : ""} · ${d.secs}s${d.usage && d.usage.in ? ` · ${d.usage.in}→${d.usage.out} tokens` : ""}${d.usage && d.usage.cost_usd != null ? ` · $${Number(d.usage.cost_usd).toFixed(3)}` : ""}</div>`
+      + (d.dossier ? `<details class="ai-dossier"><summary>What the analyst saw (${Math.round(d.dossier.length / 1000)}k characters)</summary><pre>${esc(d.dossier)}</pre></details>` : "");
     const list = (arr) => (arr && arr.length) ? `<ul>${arr.map(x => `<li>${esc(x)}</li>`).join("")}</ul>` : `<div class="empty">–</div>`;
     const propRow = (p, i) => `<div class="ai-prop" data-i="${i}">
         <div><div class="ai-prop-h">${esc(p.team || "")} ${p.fairness ? `<small>· ${esc(p.fairness)}</small>` : ""} ${p.likelihood != null ? `<small>· ${p.likelihood}% they'd accept</small>` : ""}</div>
@@ -643,7 +711,7 @@ window.TradeView = (function () {
     }
     if (T.histErr) { body.innerHTML = `<div class="err-msg">${esc(T.histErr)}</div>`; return; }
     if (!T.history.length) { body.innerHTML = `<div class="empty">No completed trades in this league yet this season.</div>`; return; }
-    body.innerHTML = T.history.map(tr => `<div class="hist-row"><span class="hist-wk">WK ${tr.week ?? "–"}${tr.when ? `<br>${new Date(tr.when).toLocaleDateString(undefined, { month: "short", day: "numeric" })}` : ""}</span>
+    body.innerHTML = T.history.map(tr => `<div class="hist-row"><span class="hist-wk">${tr.week != null ? `WK ${tr.week}<br>` : ""}${tr.when ? new Date(tr.when).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : ""}</span>
         <div>${tr.sides.map(s => `<div class="hist-side"><b>${esc(s.team)}</b> gets ${s.gets.map(p => `<span>${p.pos ? posBadge(p.pos) : ""} <span class="pm-open" ${pdata({ name: p.name, sleeper_id: p.sleeper_id, espn_id: p.espn_id, pos: p.pos })}>${esc(p.name)}</span></span>`).join(", ")}${s.picks && s.picks.length ? `, picks ${s.picks.map(esc).join(", ")}` : ""}${!s.gets.length && !(s.picks || []).length ? "nothing" : ""}</div>`).join("")}</div></div>`).join("");
   }
 

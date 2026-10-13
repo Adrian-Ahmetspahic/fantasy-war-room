@@ -46,7 +46,7 @@ function teamLogo(team) {
 }
 function pdata(p) {
   return `data-espn="${esc(p.espn_id || "")}" data-sleeper="${esc(p.sleeper_id || "")}" `
-    + `data-team="${esc(p.team || "")}" data-pos="${esc(p.pos || "")}" data-name="${esc(p.name || "")}"`;
+    + `data-team="${esc(p.team || "")}" data-pos="${esc(p.pos || "")}" data-name="${esc(p.name || "")}" data-gs="${esc(p.game_status || "")}"`;
 }
 function pkey(p) { return String(p.sleeper_id || p.espn_id || p.name); }
 function allOf(t) { return [...(t.players || []), ...(t.bench || [])].filter(p => p.name && p.name !== "(empty)"); }
@@ -79,7 +79,7 @@ let leagues = store.get("leagues", []);          // [{id, name, provider}]
 let curLeagueId = store.get("league", null);
 let curView = "live";
 let viewOpts = {};
-const VIEWS = ["live", "rosters", "trade", "lab"];
+const VIEWS = ["live", "gameday", "rosters", "trade", "lab"];
 
 const rosterCache = {};   // id -> {ts, promise}
 function getRosters(id, force = false) {
@@ -108,6 +108,7 @@ function routeFromHash() {
   viewOpts = {};
 }
 function setView(view, leagueId, opts) {
+  if (view !== "gameday" && window.GameDay) GameDay.stop();
   curView = view;
   if (leagueId) { curLeagueId = leagueId; store.set("league", leagueId); }
   if (!curLeagueId && leagues.length) curLeagueId = leagues[0].id;
@@ -140,6 +141,8 @@ function renderCurrentView(opts) {
   else if (curView === "lab") renderLabView();
   else if (curView === "trade") {
     if (window.TradeView) TradeView.open($("#view-trade"), curLeagueId, opts);
+  } else if (curView === "gameday") {
+    if (window.GameDay) GameDay.open($("#view-gameday"), curLeagueId, opts);
   }
 }
 function setLeaguesFromDashboard(data) {
@@ -237,7 +240,7 @@ function scoreBlock(mu) {
 function cardTools(lg, idx) {
   const id = esc(lg.id || "");
   return `<span class="head-right">
-      <button class="iconbtn expand-btn" data-idx="${idx}" title="Expand this league">⤢</button>
+      <button class="iconbtn expand-btn" data-idx="${idx}" title="Game Day: this matchup with a live feed">📺</button>
       <button class="iconbtn go-btn" data-view="rosters" data-id="${id}" title="All rosters">👥</button>
       <button class="iconbtn go-btn" data-view="trade" data-id="${id}" title="Trade center">⇄</button>
       <button class="iconbtn go-btn" data-view="lab" data-id="${id}" title="League lab">📊</button>
@@ -259,8 +262,10 @@ function cardHTML(lg, key) {
   const isMine = !!(mu.a_is_me || mu.b_is_me);
   const winning = (mu.a.score || 0) >= (mu.b.score || 0);
   const opt = optimalForTeam(lg.my_team);
-  const optChip = (isMine && opt && opt.left > 0.5)
-    ? `<div class="opt-row"><button class="ghost opt-chip" data-idx="${idx}">Bench left +${opt.left} pts</button></div>` : "";
+  const chips = [];
+  if (isMine && opt && opt.left > 0.5) chips.push(`<button class="ghost opt-chip" data-idx="${idx}">Bench left +${opt.left} pts</button>`);
+  if (lg.my_team) chips.push(`<button class="ghost opt-chip vegas-chip" data-id="${esc(lg.id || "")}">🎰 Vegas lineup</button>`);
+  const optChip = chips.length ? `<div class="opt-row">${chips.join(" ")}</div>` : "";
   return `<section class="card ${winning ? "winning" : "losing"} ${isMine ? "" : "other"}" data-key="${key}">
       <div class="card-head">
         <span class="league-name">${esc(lg.league_name)} <span class="prov ${lg.provider}">${lg.provider}</span></span>
@@ -331,6 +336,7 @@ async function load() {
     });
     $("#updated").textContent = "updated " + new Date().toLocaleTimeString();
     setLeaguesFromDashboard(data);
+    if (curView === "gameday" && window.GameDay) { if (!$("#view-gameday").querySelector(".gd")) GameDay.open($("#view-gameday"), curLeagueId, { keep: true }); else GameDay.refresh(); }
   } catch (e) {
     showBanner("Could not reach the local server. Is it still running? (" + e + ")");
   }
@@ -345,7 +351,9 @@ grid.addEventListener("click", e => {
     renderCards(); return;
   }
   const ex = e.target.closest(".expand-btn");
-  if (ex) { openFocus(parseInt(ex.dataset.idx, 10)); return; }
+  if (ex) { const i = parseInt(ex.dataset.idx, 10); navigate("gameday", (lastData.leagues[i] || {}).id, { matchup: cardIdx["lg" + i] || 0 }); return; }
+  const vc = e.target.closest(".vegas-chip");
+  if (vc) { openVegasLineup(vc.dataset.id); return; }
   const go = e.target.closest(".go-btn");
   if (go) { navigate(go.dataset.view, go.dataset.id); return; }
   const oc = e.target.closest(".opt-chip");
@@ -732,7 +740,7 @@ function gamelogTable(gl) {
   const cols = gl.columns || [], rows = gl.rows;
   const scale = cols.map((c, ci) => {
     let mn = Infinity, mx = -Infinity, any = false;
-    rows.forEach(r => { const v = num(r.values[ci]); if (v != null) { any = true; if (v < mn) mn = v; if (v > mx) mx = v; } });
+    rows.filter(r => !r.dnp).forEach(r => { const v = num(r.values[ci]); if (v != null) { any = true; if (v < mn) mn = v; if (v > mx) mx = v; } });
     return any ? { mn, mx, dir: c.dir } : null;
   });
   let gh = `<th class="lead" colspan="3"></th>`;
@@ -744,24 +752,27 @@ function gamelogTable(gl) {
   const colHead = `<th>Wk</th><th class="lft">Opp</th><th>Res</th>` + cols.map(c => `<th class="${c.name === "fpts" ? "fpts" : ""}">${esc(c.label)}</th>`).join("");
   const body = rows.map(r => {
     const opp = `${r.atVs || ""} ${r.opp || ""}`.trim();
-    const res = r.result ? `<span class="res res-${esc(r.result)}">${esc(r.result)}</span>` : "";
+    const res = r.dnp ? `<span class="res res-DNP" title="Did not play${r.result ? " · team " + esc(r.result) + (r.score ? " " + esc(r.score) : "") : ""}">DNP</span>`
+      : r.result ? `<span class="res res-${esc(r.result)}">${esc(r.result)}</span>` : "";
     const cells = cols.map((c, ci) => {
+      if (r.dnp) return `<td class="${c.name === "fpts" ? "fpts" : ""} dnp-cell">${c.name === "fpts" ? "0.0" : "0"}</td>`;
       const raw = r.values[ci], v = num(raw);
       const bg = (scale[ci] && v != null) ? gradeColor(v, scale[ci]) : "";
       const disp = (raw === "" || raw == null) ? "–" : (c.name === "fpts" ? Number(raw).toFixed(1) : esc(raw));
       return `<td class="${c.name === "fpts" ? "fpts" : ""}" ${bg ? `style="background:${bg}"` : ""}>${disp}</td>`;
     }).join("");
-    return `<tr><td class="wk">${r.playoff ? "P" : ""}${r.week ?? ""}</td><td class="lft opp">${r.opp_logo ? `<img src="${esc(r.opp_logo)}" alt="">` : ""}${esc(opp || "—")}</td><td>${res}</td>${cells}</tr>`;
+    return `<tr class="${r.dnp ? "dnp" : ""}"><td class="wk">${r.playoff ? "P" : ""}${r.week ?? ""}</td><td class="lft opp">${r.opp_logo ? `<img src="${esc(r.opp_logo)}" alt="">` : ""}${esc(opp || "—")}</td><td>${res}</td>${cells}</tr>`;
   }).join("");
-  const regRows = rows.filter(r => !r.playoff);
-  const base = regRows.length ? regRows : rows;
+  const regRows = rows.filter(r => !r.playoff && !r.dnp);
+  const missed = rows.filter(r => r.dnp).length;
+  const base = regRows.length ? regRows : rows.filter(r => !r.dnp);
   const avg = cols.map((c, ci) => { let s = 0, n = 0; base.forEach(r => { const v = num(r.values[ci]); if (v != null) { s += v; n++; } }); return n ? s / n : null; });
   const avgCells = cols.map((c, ci) => {
     const a = avg[ci]; const bg = (scale[ci] && a != null) ? gradeColor(a, scale[ci]) : "";
     return `<td class="${c.name === "fpts" ? "fpts" : ""}" ${bg ? `style="background:${bg}"` : ""}>${a == null ? "–" : a.toFixed(1)}</td>`;
   }).join("");
   return `<div class="tablewrap"><table class="glog"><thead><tr class="ghead">${gh}</tr><tr>${colHead}</tr></thead><tbody>${body}</tbody></table></div>
-    <div class="avg-title">Season averages · per game (${base.length} G, regular season)</div>
+    <div class="avg-title">Season averages · per game played (${base.length} G${missed ? `, ${missed} missed` : ""}, regular season)</div>
     <div class="tablewrap"><table class="glog avg"><thead><tr>${colHead}</tr></thead>
       <tbody><tr><td class="wk"></td><td class="lft">AVG</td><td></td>${avgCells}</tr></tbody></table></div>`;
 }
@@ -782,7 +793,8 @@ function outlookBlock(o) {
 function depthChart(dp) {
   if (!dp || !dp.positions || !dp.positions.length) return `<div class="empty">No depth chart available.</div>`;
   return `<div class="depth">${dp.positions.map(pos => `<div class="depth-col"><div class="depth-h">${posBadge(pos.pos)}</div>
-      ${pos.players.slice(0, 6).map((pl, i) => `<div class="depth-p ${pl.is_this ? "me" : ""}"><span class="depth-rank">${i + 1}</span><span class="depth-name">${esc(pl.name)}</span></div>`).join("")}</div>`).join("")}</div>`;
+      ${pos.players.slice(0, 6).map((pl, i) => `<div class="depth-p ${pl.is_this ? "me" : ""}"><span class="depth-rank">${i + 1}</span>
+        <span class="depth-name ${pl.id ? "pm-open" : ""}" ${pl.id ? pdata({ espn_id: pl.id, name: pl.name, team: dp.team, pos: pos.pos }) : ""} title="${pl.id ? "Open profile" : ""}">${esc(pl.name)}</span></div>`).join("")}</div>`).join("")}</div>`;
 }
 
 const pmodal = $("#pmodal");
@@ -795,7 +807,7 @@ function openPlayer(d) {
   const key = pmKey(d);
   let tab = pmTabs.find(t => t.key === key);
   if (!tab) {
-    tab = { key, name: d.name || "Player", d, data: null, err: null, avail: null, odds: null, panel: "log" };
+    tab = { key, name: d.name || "Player", d, data: null, err: null, avail: null, odds: null, live: null, panel: d.gs === "in" ? "live" : "log" };
     pmTabs.push(tab); fetchProfile(tab);
   }
   pmActiveKey = key; pmodal.hidden = false; renderPmTabs(); renderPmBody();
@@ -824,12 +836,14 @@ function renderPmBody() {
 function closePmTab(key) {
   const i = pmTabs.findIndex(t => t.key === key);
   if (i < 0) return;
+  GameDay.stopLive(pmTabs[i]);
   pmTabs.splice(i, 1);
   if (pmActiveKey !== key) { renderPmTabs(); return; }
   const next = pmTabs[i] || pmTabs[i - 1];
   if (next) { pmActiveKey = next.key; renderPmTabs(); renderPmBody(); } else closePmWindow();
 }
 function closePmWindow() {
+  pmTabs.forEach(t => GameDay.stopLive(t));
   pmodal.hidden = true; pmTabs = []; pmActiveKey = null; pmBody.innerHTML = ""; pmTabsEl.innerHTML = "";
   $("#pmResults").hidden = true;
 }
@@ -848,9 +862,16 @@ function renderPlayerInto(tab) {
       <div class="pp-sub">${posBadge(p.pos)} ${teamLogo(p.team)} ${esc(p.team || "")}
         ${p.value != null ? `<span class="pp-val">${fmtVal(p.value)} · ${posRankStr(p)} ${trendArrow(p.trend)}</span>` : ""}</div></div></div>`;
   const pane = (name, label) => `<button class="ptab ${panel === name ? "active" : ""}" data-panel="${name}">${label}</button>`;
+  const sr = p.season_rank;
+  const rankStrip = sr ? `<div class="rank-strip">
+      <div class="rank-card"><div class="opt-k">${esc(sr.pos)} rank · total points</div><div class="rank-v">${esc(sr.pos)}${sr.total_rank ?? "–"}<small>/${sr.n}</small></div><div class="rank-sub">${(sr.total_pts || 0).toFixed(1)} pts · ${sr.gp} G</div></div>
+      <div class="rank-card"><div class="opt-k">${esc(sr.pos)} rank · per game</div><div class="rank-v">${sr.ppg_rank ? esc(sr.pos) + sr.ppg_rank : "–"}<small>${sr.ppg_rank ? "/" + sr.n_ppg : ""}</small></div><div class="rank-sub">${sr.ppg != null ? sr.ppg.toFixed(1) + " ppg" : "no games yet"}</div></div>
+      <div class="rank-note">${esc(sr.season)} season · PPR · per-game rank counts anyone who has played</div>
+    </div>` : "";
   pmBody.scrollTop = 0;
-  pmBody.innerHTML = head + `<div id="availHost" class="avail"><div class="avail-loading">Checking your leagues…</div></div>`
-    + `<div class="ptabs">${pane("log", "Game Log")}${pane("news", "News &amp; Outlook")}${pane("depth", "Depth Chart")}${pane("odds", "Vegas")}</div>`
+  pmBody.innerHTML = head + rankStrip + `<div id="availHost" class="avail"><div class="avail-loading">Checking your leagues…</div></div>`
+    + `<div class="ptabs">${pane("live", tab.live && tab.live.game && tab.live.game.status === "in" ? `<span class="livedot"></span>Live` : "This Week")}${pane("log", "Game Log")}${pane("news", "News &amp; Outlook")}${pane("depth", "Depth Chart")}${pane("odds", "Vegas")}</div>`
+    + `<div class="ppanel" data-panel="live" ${panel === "live" ? "" : "hidden"}><div id="liveHost"><div class="loading"><span class="spin"></span>Loading this week's stats…</div></div></div>`
     + `<div class="ppanel" data-panel="log" ${panel === "log" ? "" : "hidden"}><div class="panel-bar">Season ${seasonSel}</div><div id="glhost">${gamelogTable(curGl)}</div></div>`
     + `<div class="ppanel" data-panel="news" ${panel === "news" ? "" : "hidden"}><div class="sec-label espn">ESPN</div>${newsList(p.news.espn)}
         <div class="sec-label sleeper">SLEEPER</div>${newsList(p.news.sleeper)}${outlookBlock(p.outlook && p.outlook.sleeper)}</div>`
@@ -858,10 +879,12 @@ function renderPlayerInto(tab) {
     + `<div class="ppanel" data-panel="odds" ${panel === "odds" ? "" : "hidden"}><div id="oddsHost"><div class="loading">Loading odds…</div></div></div>`;
   if (tab.avail) renderAvail(tab.avail); else loadAvailability(tab);
   if (panel === "odds") { if (tab.odds) renderOdds(tab.odds); else loadOdds(tab); }
+  if (panel === "live") GameDay.loadLive(tab, pmBody.querySelector("#liveHost"));
   pmBody.querySelectorAll(".ptab").forEach(btn => btn.addEventListener("click", () => {
     tab.panel = btn.dataset.panel;
     pmBody.querySelectorAll(".ptab").forEach(b => b.classList.toggle("active", b === btn));
     pmBody.querySelectorAll(".ppanel").forEach(pan => pan.hidden = pan.dataset.panel !== btn.dataset.panel);
+    if (btn.dataset.panel === "live") GameDay.loadLive(tab, pmBody.querySelector("#liveHost")); else GameDay.stopLive(tab);
     if (btn.dataset.panel === "odds") {
       if (tab.odds) renderOdds(tab.odds);
       else { const host = pmBody.querySelector("#oddsHost"); if (host && !host.dataset.loaded) { host.dataset.loaded = "1"; loadOdds(tab); } }
@@ -875,7 +898,7 @@ function renderPlayerInto(tab) {
     if (tab.glCache[yr]) { host.innerHTML = gamelogTable(tab.glCache[yr]); return; }
     host.innerHTML = `<div class="loading">Loading ${yr}…</div>`;
     try {
-      const r = await fetch(`/api/player/gamelog?espn_id=${encodeURIComponent(p.espn_id || "")}&sleeper_id=${encodeURIComponent(p.sleeper_id || "")}&season=${yr}`, { cache: "no-store" });
+      const r = await fetch(`/api/player/gamelog?espn_id=${encodeURIComponent(p.espn_id || "")}&sleeper_id=${encodeURIComponent(p.sleeper_id || "")}&season=${yr}&team=${encodeURIComponent(p.team || "")}`, { cache: "no-store" });
       const data = await r.json(); tab.glCache[yr] = data;
       if (pmActiveKey === tab.key && tab.season === yr) host.innerHTML = gamelogTable(data);
     } catch (e) { host.innerHTML = `<div class="err-msg">Could not load ${yr}</div>`; }

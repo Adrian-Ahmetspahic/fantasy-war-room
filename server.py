@@ -296,7 +296,10 @@ def build_gamelog(params):
         espn_id = str(espn_id) if espn_id else None
     if espn_id and not sleeper_id:
         sleeper_id = _espn_sleeper_index(players).get(str(espn_id))
-    return fantasy.player_gamelog(espn_id, sleeper_id, season)
+    team = (params.get("team") or [""])[0] or None
+    if not team and sleeper_id:
+        team = (players.get(str(sleeper_id)) or {}).get("team")
+    return fantasy.player_gamelog(espn_id, sleeper_id, season, team)
 
 
 def build_league_trades(full_id):
@@ -348,18 +351,27 @@ def run_ai_trade(body):
     if cfg is None:
         return {"error": "config.json not found."}
     fid = body.get("id") or ""
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         fr = ex.submit(build_rosters, fid)
         fl = ex.submit(build_league_lab, fid)
+        ft = ex.submit(build_league_trades, fid)
+        fd = ex.submit(fantasy.dk_props)
         rosters = fr.result()
-        try:
-            lab = fl.result()
-        except Exception as e:
-            print(f"[ai] lab unavailable: {e}")
-            lab = None
+        extras = {}
+        for key, fut in (("lab", fl), ("trades", ft), ("dk", fd)):
+            try:
+                extras[key] = fut.result()
+            except Exception as e:
+                print(f"[ai] {key} unavailable: {e}")
+                extras[key] = None
     if rosters.get("error"):
         return rosters
-    return ai_trade.analyze(cfg, rosters, lab if lab and not lab.get("error") else None, body)
+    lab = extras["lab"] if extras["lab"] and not extras["lab"].get("error") else None
+    trades = (extras["trades"] or {}).get("trades") if extras["trades"] else None
+    if extras["dk"]:                      # Vegas lines on every rostered player
+        for t in rosters.get("teams") or []:
+            fantasy._dk_enrich_team(t, extras["dk"])
+    return ai_trade.analyze(cfg, rosters, lab, body, trades=trades)
 
 
 def build_league_lab(full_id):
@@ -393,6 +405,31 @@ def build_league_lab(full_id):
                     season, week, nfl, _override_for(cfg, league_id))
         return {"error": "league not found in config"}
     return {"error": "unknown provider"}
+
+
+def build_player_live(params):
+    espn_id = (params.get("espn_id") or [""])[0] or None
+    sleeper_id = (params.get("sleeper_id") or [""])[0] or None
+    team = (params.get("team") or [""])[0] or None
+    pos = (params.get("pos") or [""])[0] or None
+    name = (params.get("name") or [""])[0] or "Player"
+    if not sleeper_id:
+        sleeper_id = fantasy.resolve_sleeper_id(espn_id, name, team)
+    return fantasy.player_live(sleeper_id, espn_id, name, team, pos)
+
+
+def build_vegas_lineup(full_id):
+    rosters = build_rosters(full_id)
+    if rosters.get("error"):
+        return rosters
+    me = next((t for t in rosters.get("teams") or [] if t.get("is_me")), None)
+    if not me:
+        return {"error": "Could not find your team in this league."}
+    out = fantasy.vegas_lineup(me, rosters.get("slots") or [], fantasy.dk_props(),
+                               fantasy.nfl_game_status())
+    out["league_name"] = rosters.get("league_name")
+    out["week"] = rosters.get("week")
+    return out
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -478,6 +515,21 @@ class Handler(BaseHTTPRequestHandler):
                 traceback.print_exc()
                 self._send(500, {"error": str(e)})
             return
+        if path == "/api/player/live":
+            try:
+                self._send(200, build_player_live(parse_qs(parts.query)))
+            except Exception as e:
+                traceback.print_exc()
+                self._send(500, {"error": str(e)})
+            return
+        if path == "/api/lineup/vegas":
+            q = parse_qs(parts.query)
+            try:
+                self._send(200, build_vegas_lineup((q.get("id") or [""])[0]))
+            except Exception as e:
+                traceback.print_exc()
+                self._send(500, {"error": str(e)})
+            return
         if path == "/api/league/trades":
             q = parse_qs(parts.query)
             try:
@@ -520,6 +572,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/ai/settings":
             try:
                 return self._send(200, save_ai_settings(body))
+            except Exception as e:
+                traceback.print_exc()
+                return self._send(500, {"error": str(e)})
+        if path == "/api/feed":
+            try:
+                return self._send(200, fantasy.live_feed(body.get("players") or []))
             except Exception as e:
                 traceback.print_exc()
                 return self._send(500, {"error": str(e)})
