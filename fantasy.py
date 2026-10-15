@@ -636,7 +636,7 @@ def sleeper_all_rosters(league_id, week, players, nfl, my_user_id=None, override
     fc = _fc_for(len(rosters), params)
     gstart = _global_starters(matchups)
     season = str(league.get("season") or sleeper_state().get("season"))
-    sstats, byes = season_stats(season), nfl_byes(season)
+    sstats, byes, ranks = season_stats(season), nfl_byes(season), season_pos_ranks(season)
     teams = []
     for r in rosters:
         m = by_roster.get(r["roster_id"])
@@ -650,7 +650,7 @@ def sleeper_all_rosters(league_id, week, players, nfl, my_user_id=None, override
         t["pf"] = round(st.get("fpts", 0) + st.get("fpts_decimal", 0) / 100, 2)
         t["pa"] = round(st.get("fpts_against", 0) + st.get("fpts_against_decimal", 0) / 100, 2)
         _fc_enrich_team(t, fc)
-        _season_enrich_team(t, sstats, byes, params["ppr"])
+        _season_enrich_team(t, sstats, byes, params["ppr"], ranks)
         teams.append(t)
     _rank_strength(teams)
     teams.sort(key=lambda t: -(t["score"] or 0))
@@ -662,6 +662,7 @@ def sleeper_all_rosters(league_id, week, players, nfl, my_user_id=None, override
         "week": week,
         "season": season,
         "slots": slots,
+        "roster_size": len([p for p in (league.get("roster_positions") or []) if p != "IR"]),
         "scoring": {"ppr": params["ppr"], "num_qbs": params["num_qbs"],
                     "dynasty": params["dynasty"], "teams": len(rosters),
                     "playoff_teams": settings.get("playoff_teams") or 6,
@@ -740,8 +741,9 @@ def _season_line(pos, s, gp):
     return "; ".join(P) or None
 
 
-def _season_enrich_team(t, sstats, byes, ppr=1):
+def _season_enrich_team(t, sstats, byes, ppr=1, ranks=None):
     key = "pts_ppr" if ppr >= 1 else ("pts_half_ppr" if ppr >= 0.4 else "pts_std")
+    ranks = ranks or {}
     try:
         pdb = sleeper_players()
     except Exception:
@@ -758,6 +760,9 @@ def _season_enrich_team(t, sstats, byes, ppr=1):
             if meta.get("injury_status"):
                 note = " · ".join(x for x in (meta.get("injury_body_part"), meta.get("injury_notes")) if x)
                 p["injury_note"] = note or None
+        rk = ranks.get(sid) or {}
+        p["rank_total"] = rk.get("total_rank")
+        p["rank_ppg"] = rk.get("ppg_rank")
         s = sstats.get(sid)
         if not s:
             p["ppg"] = p["gp"] = p["snap_pct"] = p["season_line"] = None
@@ -1082,7 +1087,7 @@ def espn_all_rosters(league_id, espn_s2, swid, season, week, nfl, override=None)
     my_id = _espn_my_team_id(league, swid)
     params = _espn_val_params(league, override)
     fc = _fc_for(len(raw_teams), params)
-    sstats, byes = season_stats(season), nfl_byes(str(season))
+    sstats, byes, ranks = season_stats(season), nfl_byes(str(season)), season_pos_ranks(season)
     teams = []
     for raw in raw_teams:
         t = _espn_build_team(raw, week, nfl)
@@ -1095,7 +1100,7 @@ def espn_all_rosters(league_id, espn_s2, swid, season, week, nfl, override=None)
         t["pf"] = round(ov.get("pointsFor", 0), 2)
         t["pa"] = round(ov.get("pointsAgainst", 0), 2)
         _fc_enrich_team(t, fc)
-        _season_enrich_team(t, sstats, byes, params["ppr"])
+        _season_enrich_team(t, sstats, byes, params["ppr"], ranks)
         teams.append(t)
     _rank_strength(teams)
     teams.sort(key=lambda t: -(t["score"] or 0))
@@ -1107,6 +1112,8 @@ def espn_all_rosters(league_id, espn_s2, swid, season, week, nfl, override=None)
         "week": week,
         "season": str(season),
         "slots": _espn_lineup_slots(league),
+        "roster_size": sum(int(n or 0) for sid, n in ((((league.get("settings") or {}).get("rosterSettings") or {})
+                                                     .get("lineupSlotCounts") or {}).items()) if int(sid) != 21),
         "scoring": {"ppr": params["ppr"], "num_qbs": params["num_qbs"],
                     "dynasty": params["dynasty"], "teams": len(raw_teams),
                     "playoff_teams": ss.get("playoffTeamCount") or 6,
@@ -1228,26 +1235,80 @@ def win_probability(my_team, opp_team):
 # --------------------------------------------------------------------------
 _FC_CACHE = {}
 _FC_SIZES = [8, 10, 12, 14, 16]
+_FC_TREND_CACHE = {}
+_SETTINGS = {"trend_days": 30}       # value-trend window; set from config / Settings UI
+TREND_CHOICES = (3, 7, 14, 30)
+
+
+def trend_days():
+    return _SETTINGS["trend_days"]
+
+
+def set_trend_days(n):
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return trend_days()
+    if n not in TREND_CHOICES:
+        n = min(TREND_CHOICES, key=lambda x: abs(x - n))
+    if n != _SETTINGS["trend_days"]:
+        _SETTINGS["trend_days"] = n
+        _FC_CACHE.clear()                 # values carry the trend -> rebuild
+    return n
+
+
+def fantasycalc_trends(num_qbs=1, dynasty=False, days=14):
+    """{sleeper_id|espn_id: value change over the last `days` days} from
+    FantasyCalc's trend endpoint (same scale as the 30-day trend)."""
+    key = (dynasty, num_qbs, int(days))
+    hit = _FC_TREND_CACHE.get(key)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+    out = {}
+    try:
+        url = (f"https://api.fantasycalc.com/players/values/trend?"
+               f"isDynasty={'true' if dynasty else 'false'}&numQbs={num_qbs}&lastXDays={int(days)}")
+        for it in _get_json(url, timeout=20):
+            pl = it.get("player") or {}
+            v = it.get("value")
+            if pl.get("sleeperId"):
+                out["s:" + str(pl["sleeperId"])] = v
+            if pl.get("espnId"):
+                out["e:" + str(pl["espnId"])] = v
+    except Exception as e:
+        print(f"[fantasycalc] trend fetch failed: {e}")
+        if hit:
+            return hit[1]
+    _FC_TREND_CACHE[key] = (time.time(), out)
+    return out
 
 
 def fantasycalc_values(num_teams=12, num_qbs=1, ppr=1, dynasty=False):
     """Cached FantasyCalc value set, indexed by Sleeper and ESPN player id."""
     nt = min(_FC_SIZES, key=lambda x: abs(x - (num_teams or 12)))
-    key = (dynasty, num_qbs, ppr, nt)
+    days = trend_days()
+    key = (dynasty, num_qbs, ppr, nt, days)
     hit = _FC_CACHE.get(key)
     if hit and time.time() - hit[0] < 3600:
         return hit[1]
-    idx = {"by_sleeper": {}, "by_espn": {}, "list": []}
+    idx = {"by_sleeper": {}, "by_espn": {}, "list": [], "trend_days": days}
+    tr = fantasycalc_trends(num_qbs, dynasty, days) if days != 30 else None
     url = (f"https://api.fantasycalc.com/values/current?"
            f"isDynasty={'true' if dynasty else 'false'}"
            f"&numQbs={num_qbs}&numTeams={nt}&ppr={ppr}")
     try:
         for it in _get_json(url, timeout=20):
             pl = it.get("player") or {}
-            entry = {"value": it.get("value"), "ovr": it.get("overallRank"),
-                     "pos": it.get("positionRank"), "trend": it.get("trend30Day")}
             sid = str(pl["sleeperId"]) if pl.get("sleeperId") else None
             eid = str(pl["espnId"]) if pl.get("espnId") else None
+            trend = it.get("trend30Day")
+            if tr is not None:            # custom window: value change over `days`
+                trend = tr.get("s:" + sid) if sid else None
+                if trend is None and eid:
+                    trend = tr.get("e:" + eid)
+                trend = trend or 0
+            entry = {"value": it.get("value"), "ovr": it.get("overallRank"),
+                     "pos": it.get("positionRank"), "trend": trend}
             if sid:
                 idx["by_sleeper"][sid] = entry
             if eid:
@@ -1320,6 +1381,7 @@ def _fc_enrich(player, fc):
     player["ovr_rank"] = e["ovr"] if e else None
     player["pos_rank"] = e["pos"] if e else None
     player["trend"] = e["trend"] if e else None
+    player["trend_days"] = fc.get("trend_days", 30)
     return player
 
 
@@ -2764,3 +2826,39 @@ def _fill_missed_games(gl, season, fallback_team):
                             key=lambda r: (bool(r.get("playoff")), r["week"] if isinstance(r.get("week"), int) else 999))
         gl["missed"] = len(added)
     return gl
+
+
+
+# --------------------------------------------------------------------------
+# Playground: build a roster-style player dict for any player, in a league's
+# value format (so the "what if" roster compares like-for-like)
+# --------------------------------------------------------------------------
+def player_card(rosters, sleeper_id=None, espn_id=None, name=None, team=None, pos=None):
+    pdb = sleeper_players()
+    sid = str(sleeper_id) if sleeper_id else (_sid_for({"espn_id": espn_id, "name": name, "team": team, "pos": pos}) or None)
+    meta = pdb.get(sid) if sid else None
+    if meta:
+        if pos_is_def(meta):
+            pos, team = "DEF", canon_team(meta.get("team") or sid)
+            name = f"{team} D/ST"
+        else:
+            name = meta.get("full_name") or name
+            pos = meta.get("position") or pos
+            team = canon_team(meta.get("team"))
+        espn_id = str(meta.get("espn_id")) if meta.get("espn_id") else espn_id
+    sc = rosters.get("scoring") or {}
+    season, week = rosters.get("season"), rosters.get("week")
+    fc = _fc_for(sc.get("teams") or 12, {"num_qbs": sc.get("num_qbs", 1), "ppr": sc.get("ppr", 1),
+                                         "dynasty": bool(sc.get("dynasty"))})
+    proj = _sleeper_projections(season, week, sc.get("ppr", 1)) if season and week else {}
+    nfl = nfl_game_status()
+    g = nfl.get(canon_team(team)) or {}
+    p = {"name": name, "pos": pos, "team": canon_team(team), "sleeper_id": sid, "espn_id": espn_id,
+         "points": 0, "projected": proj.get(sid) if sid else None, "starter": False, "slot": None,
+         "game_status": g.get("status", "pre"), "game_detail": g.get("detail", ""),
+         "opp": g.get("opp"), "opp_ha": g.get("ha"),
+         "injury": _injury_code((meta or {}).get("injury_status"))}
+    _fc_enrich(p, fc)
+    _season_enrich_team({"players": [p], "bench": []}, season_stats(season), nfl_byes(season),
+                        sc.get("ppr", 1), season_pos_ranks(season))
+    return p

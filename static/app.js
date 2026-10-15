@@ -29,7 +29,7 @@ function fmtVal(v) { if (v == null) return ""; return v >= 1000 ? (v / 1000).toF
 function trendArrow(t) {
   if (t == null || t === 0) return "";
   const up = t > 0;
-  return `<span class="trend ${up ? "up" : "down"}">${up ? "▲" : "▼"}${Math.abs(t)}</span>`;
+  return `<span class="trend ${up ? "up" : "down"}" title="Value change over the last ${TREND_DAYS} days">${up ? "▲" : "▼"}${Math.abs(t)}</span>`;
 }
 function posRankStr(p) { return p.pos_rank != null ? `${posLabel(p.pos)}${p.pos_rank}` : ""; }
 function injBadge(p) {
@@ -58,6 +58,8 @@ const SLOT_ELIG = {
   WRT: ["WR", "TE"], WRRB: ["WR", "RB"], IDP: ["DL", "LB", "DB"],
 };
 
+let TREND_DAYS = store.get("trendDays", 30);
+const trendLbl = () => `${TREND_DAYS}d`;
 let toastTimer = null;
 function toast(msg) {
   let el = $("#toast");
@@ -549,8 +551,8 @@ function labWaivers(d) {
 function labBuySell(d) {
   const c = arr => arr.length ? arr.map(p => `<div class="lab-row">${posBadge(p.pos)}<span class="lab-name">${esc(p.name)} <small>${esc(p.owner)}</small></span>
       <span class="lab-val">${fmtVal(p.value)} ${trendArrow(p.trend)}</span></div>`).join("") : `<div class="empty">–</div>`;
-  return `<div class="root-wrap" style="padding:0"><div class="root-col"><div class="sec-label" style="background:#dc2626">SELL HIGH · rising 30d</div>${c(d.buysell.sell)}</div>
-      <div class="root-col"><div class="sec-label" style="background:#16a34a">BUY LOW · falling 30d</div>${c(d.buysell.buy)}</div></div>`;
+  return `<div class="root-wrap" style="padding:0"><div class="root-col"><div class="sec-label" style="background:#dc2626">SELL HIGH · rising ${trendLbl()}</div>${c(d.buysell.sell)}</div>
+      <div class="root-col"><div class="sec-label" style="background:#16a34a">BUY LOW · falling ${trendLbl()}</div>${c(d.buysell.buy)}</div></div>`;
 }
 function labVegas(d) {
   if (!d.vegas_edge.over.length && !d.vegas_edge.under.length)
@@ -645,7 +647,8 @@ $("#rootingBtn").addEventListener("click", openRooting);
 let aiStatus = null;
 async function fetchAiStatus(force) {
   if (aiStatus && !force) return aiStatus;
-  try { const r = await fetch("/api/ai/settings", { cache: "no-store" }); aiStatus = await r.json(); }
+  try { const r = await fetch("/api/ai/settings", { cache: "no-store" }); aiStatus = await r.json();
+    if (aiStatus.trend_days) { TREND_DAYS = aiStatus.trend_days; store.set("trendDays", TREND_DAYS); } }
   catch (e) { aiStatus = { configured: false, provider: "claude_cli", providers: {}, cli: {} }; }
   return aiStatus;
 }
@@ -670,8 +673,14 @@ async function openSettings() {
         <input type="password" id="aiKey" placeholder="${s.key_hint ? "saved (" + esc(s.key_hint) + ") — paste to replace" : "paste your key"}" autocomplete="off"></div>
       <div class="frow" id="aiUrlRow"><label>Base URL (OpenAI-compatible)</label>
         <input type="text" id="aiUrl" value="${esc(s.base_url || "")}" placeholder="https://host/v1"></div>
-      <div class="frow"><label>Model <small style="text-transform:none;font-weight:500">(optional)</small></label>
-        <input type="text" id="aiModel" value="${esc(s.model || "")}" placeholder=""></div>
+      <div class="frow"><label>Model</label>
+        <select id="aiModelSel"></select>
+        <input type="text" id="aiModel" value="${esc(s.model || "")}" placeholder="exact model id" hidden></div>
+      <div class="fnote" id="aiAcct"></div>
+      <h4>Display</h4>
+      <div class="frow"><label>Player value trend window</label>
+        <select id="trendDays">${(s.trend_choices || [3, 7, 14, 30]).map(d => `<option value="${d}" ${d === (s.trend_days || 30) ? "selected" : ""}>Last ${d} days</option>`).join("")}</select></div>
+      <div class="fnote">Every ▲/▼ trend in the app (rosters, trade center, buy-low / sell-high, AI analyst) shows the FantasyCalc value change over this window.</div>
       <div class="frow-actions">
         <button class="primary" id="aiSave">Save</button>
         <button class="ghost" id="aiClear" ${s.key_hint ? "" : "hidden"}>Remove saved key</button>
@@ -680,10 +689,26 @@ async function openSettings() {
     </div>`;
   const prov = modalBody.querySelector("#aiProv"), keyRow = modalBody.querySelector("#aiKeyRow"),
     urlRow = modalBody.querySelector("#aiUrlRow"), help = modalBody.querySelector("#aiHelp"),
-    modelIn = modalBody.querySelector("#aiModel"), who = modalBody.querySelector("#aiWho");
+    modelIn = modalBody.querySelector("#aiModel"), modelSel = modalBody.querySelector("#aiModelSel"),
+    who = modalBody.querySelector("#aiWho"), acct = modalBody.querySelector("#aiAcct");
+  const MODELS = s.models || {}, ACCTS = s.accounts || {};
+  const fillModels = (k, current) => {
+    const list = MODELS[k] || [];
+    const known = list.some(m => m.id === (current || ""));
+    modelSel.innerHTML = list.map(m => `<option value="${esc(m.id)}" ${m.id === (current || "") ? "selected" : ""}>${esc(m.label)}</option>`).join("")
+      + `<option value="__custom__" ${!known || k === "custom" ? "selected" : ""}>Custom model id…</option>`;
+    modelIn.hidden = known && k !== "custom";
+    if (!known) modelIn.value = current || "";
+  };
+  const acctLine = k => {
+    const c = ACCTS.claude, x = ACCTS.codex;
+    if (k === "claude_cli") return c ? (c.logged_in ? `Signed in as <b>${esc(c.email || "?")}</b> · <b>${esc((c.plan || "").toUpperCase())}</b> plan via ${esc(c.method || "claude.ai")} — usage counts against that plan. Calls run at standard speed/tier with fast mode off; overage ("extra usage") only applies if you've turned it on in your Claude account settings.` : `<b style="color:var(--lose)">Not signed in</b> — run <code>claude auth login</code> in Terminal.`) : "";
+    if (k === "codex_cli") return x ? (x.logged_in ? `Codex signed in via <b>${esc(x.method || "?")}</b> — usage counts against that ChatGPT plan${s.codex_pick ? ` · currently using <b>${esc(s.codex_pick)}</b>` : ""}. Overage only applies if you've enabled extra usage in your ChatGPT settings.` : `<b style="color:var(--lose)">Not signed in</b> — run <code>codex login</code> in Terminal.`) : "";
+    return k === "custom" ? "" : "Pay-as-you-go: billed by the provider per token, separate from any subscription.";
+  };
   const HELP = {
     claude_cli: `Uses the <b>Claude Code CLI</b> that's signed in with your Claude account on this computer — no API key. If it isn't signed in yet, open Terminal, run <code>claude</code> once and log in. ${cliOk.claude_cli ? "" : "<b>Not found on this machine</b> — install with <code>npm i -g @anthropic-ai/claude-code</code>."}`,
-    codex_cli: `Uses the <b>Codex CLI</b> signed in with your ChatGPT account — no API key. If it isn't signed in, run <code>codex login</code> in Terminal. Model defaults to <code>gpt-5.5</code>. ${cliOk.codex_cli ? "" : "<b>Not found on this machine</b> — install with <code>npm i -g @openai/codex</code>."}`,
+    codex_cli: `Uses the <b>Codex CLI</b> signed in with your ChatGPT account — no API key. If it isn't signed in, run <code>codex login</code> in Terminal. The model list comes from Codex itself; "Auto" tries them in order until one your plan accepts. ${cliOk.codex_cli ? "" : "<b>Not found on this machine</b> — install with <code>npm i -g @openai/codex</code>."}`,
     anthropic: `Pay-as-you-go key from <code>console.anthropic.com</code>. Default model <code>claude-sonnet-5-5</code>.`,
     openai: `Pay-as-you-go key from <code>platform.openai.com</code>. Default model <code>gpt-5</code>.`,
     custom: `Any OpenAI-compatible server (Ollama, LM Studio, OpenRouter…). Enter its base URL (ending in <code>/v1</code>), a key if it needs one, and the model name.`,
@@ -692,12 +717,17 @@ async function openSettings() {
     const k = prov.value, p = provs[k] || {};
     keyRow.hidden = !!p.cli; urlRow.hidden = k !== "custom";
     help.innerHTML = HELP[k] || "";
-    modelIn.placeholder = p.model ? `default: ${p.model}` : "provider default";
+    fillModels(k, k === s.provider ? s.model : "");
+    acct.innerHTML = acctLine(k);
     who.textContent = `${(provs[s.provider] || {}).label || s.provider}${s.model ? " · " + s.model : ""}${s.from_env ? " · key from environment" : ""}`;
   };
+  modelSel.addEventListener("change", () => { modelIn.hidden = modelSel.value !== "__custom__"; if (!modelIn.hidden) modelIn.focus(); });
   prov.addEventListener("change", sync); sync();
   modalBody.querySelector("#aiSave").addEventListener("click", async () => {
-    const body = { provider: prov.value, model: modelIn.value.trim(), base_url: modalBody.querySelector("#aiUrl").value.trim() };
+    const chosen = modelSel.value === "__custom__" ? modelIn.value.trim() : modelSel.value;
+    const body = { provider: prov.value, model: chosen, base_url: modalBody.querySelector("#aiUrl").value.trim(),
+      trend_days: parseInt(modalBody.querySelector("#trendDays").value, 10) };
+    const trendChanged = body.trend_days !== TREND_DAYS;
     const key = modalBody.querySelector("#aiKey").value.trim();
     if (key) body.api_key = key;
     const msg = modalBody.querySelector("#aiMsg"); msg.textContent = "Saving…";
@@ -706,9 +736,16 @@ async function openSettings() {
       const d = await r.json();
       if (d.error) throw new Error(d.error);
       aiStatus = d; modalBody.querySelector("#aiKey").value = "";
-      msg.textContent = "Saved."; toast("AI settings saved");
+      if (d.trend_days) { TREND_DAYS = d.trend_days; store.set("trendDays", TREND_DAYS); }
+      msg.textContent = "Saved."; toast("Settings saved");
       if (window.TradeView) TradeView.aiStatusChanged(d);
       closeModal();
+      if (trendChanged) {               // values carry the trend: refetch everything
+        Object.keys(rosterCache).forEach(k => delete rosterCache[k]);
+        Object.keys(labCache).forEach(k => delete labCache[k]);
+        load(); renderCurrentView({});
+        if (window.TradeView) TradeView.refresh();
+      }
     } catch (e) { msg.textContent = "Error: " + (e.message || e); }
   });
   modalBody.querySelector("#aiClear").addEventListener("click", async () => {
@@ -1012,6 +1049,7 @@ $("#interval").addEventListener("change", schedule);
 
 grid.innerHTML = Array.from({ length: 4 }, () => `<div class="skeleton"></div>`).join("");
 window.addEventListener("load", () => {
+  fetchAiStatus();
   routeFromHash();
   load();
   schedule();

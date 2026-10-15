@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,7 +30,9 @@ def load_config():
     if not os.path.exists(CONFIG_PATH):
         return None
     with open(CONFIG_PATH) as f:
-        return json.load(f)
+        cfg = json.load(f)
+    fantasy.set_trend_days(((cfg.get("ui") or {}).get("trend_days")) or 30)
+    return cfg
 
 
 def save_config(cfg):
@@ -118,10 +121,24 @@ def build_dashboard():
     return {"season": season, "week": week, "leagues": leagues}
 
 
-def build_rosters(full_id):
+_ROSTERS_CACHE = {}
+
+
+def build_rosters(full_id, max_age=0):
     """Return every team's full roster for a single league (all-rosters view).
 
-    full_id looks like 'sleeper:<league_id>' or 'espn:<league_id>'."""
+    full_id looks like 'sleeper:<league_id>' or 'espn:<league_id>'.
+    max_age > 0 serves a recent copy (seconds) instead of refetching."""
+    c = _ROSTERS_CACHE.get(full_id)
+    if max_age and c and time.time() - c[0] < max_age:
+        return c[1]
+    out = _build_rosters(full_id)
+    if not out.get("error"):
+        _ROSTERS_CACHE[full_id] = (time.time(), out)
+    return out
+
+
+def _build_rosters(full_id):
     cfg = load_config()
     if cfg is None:
         return {"error": "config.json not found."}
@@ -322,7 +339,10 @@ def build_league_trades(full_id):
 
 
 def ai_settings_public():
-    return ai_trade.public_status(ai_trade.settings_from(load_config() or {}))
+    out = ai_trade.public_status(ai_trade.settings_from(load_config() or {}))
+    out["trend_days"] = fantasy.trend_days()
+    out["trend_choices"] = list(fantasy.TREND_CHOICES)
+    return out
 
 
 def save_ai_settings(body):
@@ -342,6 +362,10 @@ def save_ai_settings(body):
     if "base_url" in body:
         ai["base_url"] = str(body.get("base_url") or "").strip()
     cfg["ai"] = ai
+    if body.get("trend_days") is not None:
+        ui = dict(cfg.get("ui") or {})
+        ui["trend_days"] = fantasy.set_trend_days(body["trend_days"])
+        cfg["ui"] = ui
     save_config(cfg)
     return ai_settings_public()
 
@@ -416,6 +440,15 @@ def build_player_live(params):
     if not sleeper_id:
         sleeper_id = fantasy.resolve_sleeper_id(espn_id, name, team)
     return fantasy.player_live(sleeper_id, espn_id, name, team, pos)
+
+
+def build_player_card(params):
+    fid = (params.get("id") or [""])[0]
+    rosters = build_rosters(fid, max_age=120)
+    if rosters.get("error"):
+        return rosters
+    g = lambda k: (params.get(k) or [""])[0] or None
+    return fantasy.player_card(rosters, g("sleeper_id"), g("espn_id"), g("name"), g("team"), g("pos"))
 
 
 def build_vegas_lineup(full_id):
@@ -518,6 +551,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/player/live":
             try:
                 self._send(200, build_player_live(parse_qs(parts.query)))
+            except Exception as e:
+                traceback.print_exc()
+                self._send(500, {"error": str(e)})
+            return
+        if path == "/api/player/card":
+            try:
+                self._send(200, build_player_card(parse_qs(parts.query)))
             except Exception as e:
                 traceback.print_exc()
                 self._send(500, {"error": str(e)})

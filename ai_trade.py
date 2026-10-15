@@ -32,7 +32,7 @@ import fantasy
 PROVIDERS = {
     "claude_cli": {"label": "Claude account (via Claude Code CLI)", "model": "",
                    "cli": "claude", "url": ""},
-    "codex_cli": {"label": "ChatGPT account (via Codex CLI)", "model": "gpt-5.5",
+    "codex_cli": {"label": "ChatGPT account (via Codex CLI)", "model": "",
                   "cli": "codex", "url": ""},
     "anthropic": {"label": "Anthropic API key", "model": "claude-sonnet-5-5",
                   "url": "https://api.anthropic.com/v1/messages"},
@@ -76,11 +76,58 @@ def settings_from(cfg):
     }
 
 
+MODEL_CHOICES = {
+    "claude_cli": [("", "Claude Code default"), ("sonnet", "Sonnet (latest)"), ("opus", "Opus (latest)"),
+                   ("fable", "Fable (latest)"), ("haiku", "Haiku (latest)")],
+    "anthropic": [("claude-sonnet-5-5", "Claude Sonnet 5.5"), ("claude-opus-5-5", "Claude Opus 5.5"),
+                  ("claude-fable-5-1", "Claude Fable 5.1"), ("claude-haiku-5-5", "Claude Haiku 5.5")],
+    "openai": [("gpt-5", "GPT-5"), ("gpt-5-mini", "GPT-5 mini")],
+    "custom": [],
+}
+_ACCT = {"ts": 0, "data": None}
+
+
+def account_status():
+    """Who each CLI is signed in as (cached 5 min). Read-only status calls."""
+    if _ACCT["data"] and time.time() - _ACCT["ts"] < 300:
+        return _ACCT["data"]
+    out = {"claude": None, "codex": None}
+    exe = cli_path("claude_cli")
+    if exe:
+        try:
+            r = subprocess.run([exe, "auth", "status"], capture_output=True, text=True, timeout=20, env=_cli_env())
+            j = json.loads((r.stdout or "").strip()[(r.stdout or "").find("{"):] or "{}")
+            out["claude"] = {"logged_in": bool(j.get("loggedIn")), "method": j.get("authMethod"),
+                             "email": j.get("email"), "plan": j.get("subscriptionType")}
+        except Exception as e:
+            out["claude"] = {"logged_in": False, "error": str(e)[:120]}
+    exe = cli_path("codex_cli")
+    if exe:
+        try:
+            r = subprocess.run([exe, "login", "status"], capture_output=True, text=True, timeout=20, env=_cli_env())
+            txt = ((r.stdout or "") + (r.stderr or "")).strip()
+            out["codex"] = {"logged_in": "logged in" in txt.lower(), "method": "ChatGPT" if "chatgpt" in txt.lower()
+                            else ("API key" if "api key" in txt.lower() else None), "raw": txt[:120]}
+        except Exception as e:
+            out["codex"] = {"logged_in": False, "error": str(e)[:120]}
+    _ACCT.update(ts=time.time(), data=out)
+    return out
+
+
+def model_choices():
+    m = {k: list(v) for k, v in MODEL_CHOICES.items()}
+    m["codex_cli"] = [("", "Auto (first model your ChatGPT plan supports)")] + [(x, x) for x in codex_models()]
+    return m
+
+
 def public_status(s):
     k = s.get("api_key") or ""
     p = s["provider"]
     configured = bool(cli_path(p)) if p in CLI_PROVIDERS else bool(k)
     return {
+        "models": {k2: [{"id": i, "label": l} for i, l in v] for k2, v in model_choices().items()},
+        "accounts": account_status(),
+        "codex_pick": _CODEX_PICK.get("model"),
         "configured": configured,
         "provider": p,
         "model": s["model"],
@@ -108,10 +155,13 @@ def _pline(p):
     if p.get("value") is not None:
         v = f"value {p['value']}"
         if p.get("pos_rank"):
-            v += f" ({p.get('pos')}{p['pos_rank']})"
+            v += f" (value rank {p.get('pos')}{p['pos_rank']})"
         bits.append(v)
+    if p.get("rank_total") or p.get("rank_ppg"):
+        pos = p.get("pos") or ""
+        bits.append(f"season rank {pos}{p.get('rank_total') or '–'} by total pts, {pos}{p.get('rank_ppg') or '–'} by ppg")
     if p.get("trend"):
-        bits.append(f"30d {'+' if p['trend'] > 0 else ''}{p['trend']}")
+        bits.append(f"{p.get('trend_days', 30)}d {'+' if p['trend'] > 0 else ''}{p['trend']}")
     if p.get("ppg") is not None:
         bits.append(f"{p['ppg']} ppg over {p.get('gp')} gms")
     if p.get("snap_pct") is not None:
@@ -340,12 +390,12 @@ def _lab_sections(lab, teams, A):
     if wv:
         out.append("## Best available free agents / waivers (unrostered, by value; 🔥 = trending add)\n"
                    + "\n".join(f"  {w['name']} ({w.get('pos')}, {w.get('team') or 'FA'}) value {w.get('value')}"
-                               f"{' 🔥' if w.get('hot') else ''}{' 30d ' + ('+' if w['trend'] > 0 else '') + str(w['trend']) if w.get('trend') else ''}"
+                               f"{' 🔥' if w.get('hot') else ''}{' trend ' + ('+' if w['trend'] > 0 else '') + str(w['trend']) if w.get('trend') else ''}"
                                for w in wv[:25]))
     bs = lab.get("buysell") or {}
     if bs.get("sell") or bs.get("buy"):
-        f = lambda arr: "\n".join(f"  {p['name']} ({p.get('pos')}, owned by {p.get('owner')}) value {p.get('value')}, 30d {'+' if (p.get('trend') or 0) > 0 else ''}{p.get('trend')}" for p in arr)
-        out.append("## Market trends\nSELL HIGH (rising fastest):\n" + (f(bs.get("sell") or []) or "  –")
+        f = lambda arr: "\n".join(f"  {p['name']} ({p.get('pos')}, owned by {p.get('owner')}) value {p.get('value')}, trend {'+' if (p.get('trend') or 0) > 0 else ''}{p.get('trend')}" for p in arr)
+        out.append(f"## Market trends (value change over the last {fantasy.trend_days()} days)\nSELL HIGH (rising fastest):\n" + (f(bs.get("sell") or []) or "  –")
                    + "\nBUY LOW (falling fastest):\n" + (f(bs.get("buy") or []) or "  –"))
     ve = lab.get("vegas_edge") or {}
     if ve.get("over") or ve.get("under"):
@@ -392,9 +442,11 @@ def build_dossier(rosters, lab, a_id, b_id, give, get, mode, prefs, trades=None,
             f"{'dynasty' if sc.get('dynasty') else 'redraft'}; "
             f"{sc.get('playoff_teams')} playoff teams, playoffs start week {sc.get('playoff_start')}.",
             f"Lineup slots: {', '.join(rosters.get('slots') or [])}",
-            "Trade values are FantasyCalc market values (higher = better; roughly linear). "
+            "Trade values are FantasyCalc market values (higher = better; roughly linear); 'value rank' is the "
+            "player's rank at his position by trade value. 'season rank' is his rank at his position by fantasy "
+            "points this season, both by total points and by points per game (PPR). "
             "ppg = season fantasy points per game in this league's scoring format; "
-            "'30d' = 30-day value trend; Vegas lines are DraftKings props for this week."]
+            f"'{fantasy.trend_days()}d' = value trend over the last {fantasy.trend_days()} days; Vegas lines are DraftKings props for this week."]
 
     stand = []
     for r in ((lab or {}).get("teams") or []):
@@ -485,15 +537,27 @@ SYSTEM = (
     "schedule difficulty and each team's remaining opponents; this week's matchups with live scores; "
     "power rankings with week-over-week movement; last week's recap; the best available free agents "
     "and trending adds; buy-low / sell-high market trends; Vegas-vs-projection edges; Team A's upcoming "
-    "byes; the league's completed trade history; every team's full roster with trade value, positional "
-    "rank, 30-day trend, points per game, snap share, season usage, this-week projection and points so "
-    "far, Vegas props, injuries with notes, bye week and age; each team's positional needs/surplus; and, "
-    "for the key players, news, season outlook, Vegas props and recent game-by-game scores. "
-    "When the manager asks about something, answer from the matching section (e.g. trade history -> "
-    "'League trade history'; who is free -> 'Best available free agents'; a team's schedule -> "
-    "'Remaining regular-season schedule'). Never say information is unavailable if it appears in the "
-    "data; if a section is genuinely missing or empty, say exactly that. Cite the specific numbers you "
-    "relied on. Use ONLY the data provided; do not invent stats. Be specific and concise. "
+    "byes; the league's completed trade history; every team's full roster; each team's positional "
+    "needs/surplus; and a 'Player intel' section for the key players.\n\n"
+    "EVERY PLAYER LINE carries data you must actually use, not just skim: trade value and value rank; "
+    "season rank at the position by total points AND by points per game (a player whose ppg rank is far "
+    "better than his total-points rank missed games -- treat him as the ppg player if healthy); the value "
+    "trend over the stated window (rising = market heating up, falling = market cooling); points per game "
+    "and games played; snap share and season usage (carries, targets, yards, TDs per game) as the signal "
+    "of real role; this week's projection and points so far; Vegas props; injury status with notes; bye "
+    "week; age and experience. The PLAYER INTEL section carries recent news headlines, the season outlook, "
+    "Vegas lines and recent game-by-game scores for the players that matter to this request -- recent "
+    "news OVERRIDES stale season numbers (a new injury, a role change, a trade, a return from IR), so "
+    "always check it and mention it when it changes the picture.\n\n"
+    "HOW TO ANSWER: before you write, pull the relevant numbers for every player involved -- ranks, ppg, "
+    "usage, trend, injury, news, Vegas -- and reason from them; weigh roster fit (needs/surplus, lineup "
+    "slots, byes), the team's situation (record, playoff odds, schedule) and the market (trends, trade "
+    "history, what partners need). Ground every claim in the data and cite the specific numbers and news "
+    "you relied on. When the manager asks about something, answer from the matching section (trade "
+    "history -> 'League trade history'; who is free -> 'Best available free agents'; a team's schedule -> "
+    "'Remaining regular-season schedule'; a player's form -> his line plus 'Player intel'). Never say "
+    "information is unavailable if it appears in the data; if a section is genuinely missing or empty, say "
+    "exactly that. Use ONLY the data provided; do not invent stats or news. Be specific and concise. "
     "Always answer with a single JSON object and nothing else -- no prose outside the JSON."
 )
 
@@ -549,17 +613,23 @@ def _conversation(history):
 
 
 def _user_prompt(mode, dossier, question, history=None):
+    use_all = ("Use the full context for every player involved -- season ranks (total and per game), ppg, "
+               "snap share and usage, value and trend, injury notes, bye, and especially the recent news, "
+               "outlook, Vegas lines and recent games in 'Player intel' -- and let it shape the answer. ")
     if mode == "evaluate":
-        task = ("Evaluate the proposed trade for Team A. Weigh starting-lineup impact (this week and rest of season), "
-                "depth, positional need, playoff position, injuries/news, Vegas usage signals and market value. "
-                "If it is close or bad for A, propose a realistic counter using exact roster names.")
+        task = ("Evaluate the proposed trade for Team A. " + use_all
+                + "Weigh starting-lineup impact (this week and rest of season), depth, positional need, playoff "
+                  "position, injuries/news, Vegas usage signals and market value. If it is close or bad for A, "
+                  "propose a realistic counter using exact roster names.")
     elif mode == "suggest":
         task = ("Find the best realistic trades Team A can make in this league right now, respecting the manager "
-                "preferences. Target partners whose needs match A's surplus. Prefer deals that upgrade A's starting lineup.")
+                "preferences. " + use_all
+                + "Target partners whose needs match A's surplus (use their needs/surplus lines and trade history). "
+                  "Prefer deals that upgrade A's starting lineup.")
     else:
         task = (_conversation(history)
                 + "Answer the manager's latest message using the league data (and the conversation above). "
-                  "Latest message: " + (question or "").strip()[:1500])
+                + use_all + "Latest message: " + (question or "").strip()[:1500])
     return (f"{task}\n\nRespond with JSON exactly in this shape:\n{SCHEMAS[mode]}\n\n"
             f"=== LEAGUE DATA ===\n{dossier}")
 
@@ -636,20 +706,36 @@ def _call_claude_cli(s, system, user):
     return text, {}
 
 
-def _call_codex_cli(s, system, user):
-    exe = cli_path("codex_cli")
-    if not exe:
-        raise RuntimeError("Codex CLI not found. Install it (npm i -g @openai/codex) and run "
-                           "`codex login` to sign in with your ChatGPT account.")
+_CODEX_PICK = {"model": None, "ts": 0}
+
+
+def codex_models():
+    """Model slugs Codex has cached for this account (newest Codex writes
+    ~/.codex/models_cache.json), minus internal/reserve entries."""
+    try:
+        with open(os.path.expanduser("~/.codex/models_cache.json")) as f:
+            d = json.load(f)
+        ms = d.get("models", d) if isinstance(d, dict) else d
+        out = []
+        for m in ms or []:
+            slug = (m.get("slug") or m.get("id") or "") if isinstance(m, dict) else str(m)
+            if slug and slug.startswith("gpt-") and "reserve" not in slug and "review" not in slug:
+                out.append(slug)
+        return out
+    except Exception:
+        return []
+
+
+def _codex_once(exe, model, prompt):
     fd, outp = tempfile.mkstemp(prefix="codex_", suffix=".txt")
     os.close(fd)
     cmd = [exe, "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
            "--color", "never", "-o", outp]
-    if s.get("model"):
-        cmd += ["-m", s["model"]]
+    if model:
+        cmd += ["-m", model]
     cmd.append("-")
     try:
-        r = _run_cli(cmd, system + "\n\n" + user)
+        r = _run_cli(cmd, prompt)
         try:
             with open(outp) as f:
                 text = f.read().strip()
@@ -660,16 +746,44 @@ def _call_codex_cli(s, system, user):
             os.unlink(outp)
         except OSError:
             pass
-    if not text:
-        log = (r.stderr or "") + (r.stdout or "")
-        m = re.search(r'"message":"([^"]+)"', log)
-        msg = m.group(1) if m else (log.strip().splitlines() or ["no output"])[-1]
-        if "not supported" in msg or "requires a newer version" in msg:
-            msg += "  → Set a model your Codex plan supports in ⚙ Settings (e.g. gpt-5.1-codex), or update Codex."
-        if "login" in msg.lower() or "auth" in msg.lower():
-            msg += "  → Run `codex login` in a terminal to sign in with ChatGPT, then retry."
-        raise RuntimeError(f"Codex CLI: {msg[:400]}")
-    return text, {}
+    if text:
+        return text, None
+    log = (r.stderr or "") + (r.stdout or "")
+    m = re.search(r'"message":"([^"]+)"', log)
+    return "", (m.group(1) if m else (log.strip().splitlines() or ["no output"])[-1])
+
+
+def _call_codex_cli(s, system, user):
+    """Run through Codex. Model availability on ChatGPT plans changes often, so
+    try the configured model, then (on a model error) each model Codex itself
+    lists for this account; remember the one that worked."""
+    exe = cli_path("codex_cli")
+    if not exe:
+        raise RuntimeError("Codex CLI not found. Install it (npm i -g @openai/codex) and run "
+                           "`codex login` to sign in with your ChatGPT account.")
+    prompt = system + "\n\n" + user
+    tried, last = [], None
+    candidates = [s.get("model") or _CODEX_PICK["model"] or ""]
+    candidates += [m for m in codex_models() if m not in candidates]
+    for model in candidates:
+        if model in tried:
+            continue
+        tried.append(model)
+        text, err = _codex_once(exe, model, prompt)
+        if text:
+            _CODEX_PICK["model"] = model
+            s["model"] = model
+            return text, {}
+        last = err or "no output"
+        model_err = "not supported" in last or "requires a newer version" in last or "model" in last.lower()
+        if not model_err:
+            break
+    msg = last or "no output"
+    if "login" in msg.lower() or "auth" in msg.lower():
+        msg += "  → Run `codex login` in a terminal to sign in with ChatGPT, then retry."
+    elif "not supported" in msg or "requires a newer version" in msg:
+        msg += f"  → Tried {', '.join(m or 'default' for m in tried)}. Set a model your plan supports in ⚙ Settings, or update Codex."
+    raise RuntimeError(f"Codex CLI: {msg[:400]}")
 
 
 def _call_llm(s, system, user):
@@ -735,7 +849,7 @@ def analyze(cfg, rosters, lab, req, trades=None):
         result = {"answer": text} if mode == "ask" else {"error": "The model's reply was not valid JSON.",
                                                          "raw": text[:2000]}
     return {"ok": "error" not in result, "mode": mode, "result": result,
-            "provider": s["provider"], "model": s["model"], "usage": usage,
+            "provider": s["provider"], "model": s.get("model") or "", "usage": usage,
             "a": A.get("name"), "b": B.get("name") if B else None,
             "secs": round(time.time() - t0, 1),
             "dossier": dossier}

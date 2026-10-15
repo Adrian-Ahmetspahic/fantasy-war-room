@@ -36,9 +36,9 @@ window.TradeView = (function () {
     const pool = players.filter(p => p.name && p.name !== "(empty)");
     const order = slots.map((s, i) => ({ s: s.toUpperCase(), i }))
       .sort((a, b) => (SLOT_ELIG[a.s] || [a.s]).length - (SLOT_ELIG[b.s] || [b.s]).length);
-    const used = new Set(), starters = [];
+    const used = new Set(), starters = [], bySlot = new Array(slots.length).fill(null);
     let total = 0;
-    for (const { s } of order) {
+    for (const { s, i } of order) {
       const elig = SLOT_ELIG[s] || [s];
       let best = -1, bv = -1;
       pool.forEach((p, pi) => {
@@ -46,9 +46,9 @@ window.TradeView = (function () {
         const v = p[key] || 0;
         if (v > bv) { bv = v; best = pi; }
       });
-      if (best >= 0) { used.add(best); starters.push(pool[best]); total += pool[best][key] || 0; }
+      if (best >= 0) { used.add(best); starters.push(pool[best]); bySlot[i] = pool[best]; total += pool[best][key] || 0; }
     }
-    return { total, starters };
+    return { total, starters, bySlot };   // starters: assignment order; bySlot: aligned with `slots`
   }
   function impact(t, give, get, key) {
     const gk = new Set(give.map(pkey));
@@ -180,6 +180,7 @@ window.TradeView = (function () {
               <button data-tab="ai" class="ai ${T.tab === "ai" ? "active" : ""}">🤖 AI Analyst</button>
               <button data-tab="history" class="${T.tab === "history" ? "active" : ""}">📜 History</button>
               <button data-tab="saved" class="${T.tab === "saved" ? "active" : ""}">💾 Saved${T.saved.length ? ` (${T.saved.length})` : ""}</button>
+              <button data-tab="playground" class="${T.tab === "playground" ? "active" : ""}">🧪 Playground</button>
             </div>
           </div>
           <div id="tcBottom"></div>
@@ -354,6 +355,7 @@ window.TradeView = (function () {
         <button class="primary ai" id="dealAi" ${empty ? "disabled" : ""}>🤖 Analyze with AI</button>
         <button class="ghost" id="dealSave" ${empty ? "disabled" : ""}>💾 Save proposal</button>
         <button class="ghost" id="dealCopy" ${empty ? "disabled" : ""}>📋 Copy for league chat</button>
+        <button class="ghost" id="dealPg" ${empty ? "disabled" : ""}>🧪 Try in playground</button>
         <span class="spacer"></span>
         <button class="ghost" id="dealClear" ${empty ? "disabled" : ""}>✕ Clear</button>
       </div>`;
@@ -362,6 +364,14 @@ window.TradeView = (function () {
     }));
     host.querySelector("#dealClear").addEventListener("click", () => { T.selA = new Set(); T.selB = new Set(); syncSideRows(); renderDeal(); });
     host.querySelector("#dealCopy").addEventListener("click", () => copyText(dealText(A, B, give, get)));
+    host.querySelector("#dealPg").addEventListener("click", () => {
+      const me = T.teams[meIdx()];
+      if (A !== me && B !== me) { toast("The playground edits your own team — put yourself on one side"); return; }
+      const out = A === me ? give : get, inc = A === me ? get : give;
+      pgApply(out, inc);
+      T.tab = "playground"; T.host.querySelectorAll("#tcTabs button").forEach(x => x.classList.toggle("active", x.dataset.tab === "playground"));
+      renderBottom(); T.host.querySelector("#tcBottom").scrollIntoView({ behavior: "smooth", block: "start" });
+    });
     host.querySelector("#dealSave").addEventListener("click", () => {
       T.saved.unshift({ ts: Date.now(), aId: A.id, bId: B.id, a: A.name, b: B.name, give: give.map(ref), get: get.map(ref), av, bv });
       persist(); toast("Proposal saved");
@@ -387,6 +397,7 @@ window.TradeView = (function () {
     if (T.tab === "ai") renderAiPanel(host);
     else if (T.tab === "history") renderHistory(host);
     else if (T.tab === "saved") renderSaved(host);
+    else if (T.tab === "playground") renderPlayground(host);
     else renderFinder(host);
   }
 
@@ -694,6 +705,140 @@ window.TradeView = (function () {
     const missed = (giveNames || []).length + (getNames || []).length - give.length - get.length;
     loadDeal(bi, give, get);
     toast(missed ? `Loaded (couldn't match ${missed} name${missed > 1 ? "s" : ""})` : "Proposal loaded onto the board");
+  }
+
+  /* ---- playground: edit your roster freely, compare before/after ---- */
+  const PG = { roster: null, leagueId: null, q: "", results: [], busy: false };
+  function pgLoad() {
+    if (PG.leagueId === T.leagueId && PG.roster) return;
+    PG.leagueId = T.leagueId;
+    PG.roster = store.get("pg:" + T.leagueId, null);
+    PG.results = []; PG.q = "";
+  }
+  function pgBase() { return allOf(T.teams[meIdx()]); }
+  function pgSave() { store.set("pg:" + T.leagueId, PG.roster); }
+  function pgApply(outs, ins) {
+    pgLoad();
+    const cur = PG.roster || pgBase().map(p => ({ ...p }));
+    const outK = new Set(outs.map(pkey));
+    PG.roster = cur.filter(p => !outK.has(pkey(p)));
+    ins.forEach(p => { if (!PG.roster.some(x => pkey(x) === pkey(p))) PG.roster.push({ ...p }); });
+    pgSave();
+  }
+  function pgProfile(players) {
+    const avg = leagueAvg(), mine = {}; NEED_POS.forEach(p => mine[p] = 0);
+    players.forEach(pl => { if (pl.value && NEED_POS.includes(pl.pos)) mine[pl.pos] += pl.value; });
+    return { need: NEED_POS.filter(p => avg[p] && avg[p] - mine[p] > avg[p] * 0.2), has: NEED_POS.filter(p => avg[p] && mine[p] - avg[p] > avg[p] * 0.2), mine };
+  }
+  function pgStats(players) {
+    const me = T.teams[meIdx()], slots = slotsFor(me);
+    const lv = lineup(players, slots, "value"), lp = lineup(players, slots, "projected");
+    const byes = {};
+    players.forEach(p => { if (p.bye && T.data && p.bye >= T.data.week) (byes[p.bye] = byes[p.bye] || []).push(p); });
+    return { total: sumVal(players), starters: lv.total, startersList: lv.bySlot, proj: lp.total, projList: lp.bySlot,
+      count: players.length, profile: pgProfile(players), byes, slots };
+  }
+  function renderPlayground(host) {
+    pgLoad();
+    const me = T.teams[meIdx()];
+    const base = pgBase();
+    const roster = PG.roster || base.map(p => ({ ...p }));
+    const edited = !!PG.roster;
+    const before = pgStats(base), after = pgStats(roster);
+    // your real roster is the ceiling (IR players push it past the league's slot count)
+    const limit = Math.max(T.data.roster_size || 0, base.length);
+    const baseK = new Set(base.map(pkey)), afterK = new Set(roster.map(pkey));
+    const d = (a, b, f = fmtVal) => { const v = b - a; return `<b class="${dcls(v)}">${signed(v, f)}</b>`; };
+    const starterNames = st => st.startersList.filter(Boolean).map(pkey);
+    const bS = new Set(starterNames(before)), aS = new Set(starterNames(after));
+    const lineupCol = (st, other, label) => `<div class="pg-lineup"><div class="ai-sec-h">${label} · starters by value</div>
+        ${st.slots.map((sl, i) => { const p = st.startersList[i]; const chg = p && !other.has(pkey(p)); return `<div class="pg-slot ${chg ? "chg" : ""}">${posBadge(sl)}<span class="pg-slot-n">${p ? esc(abbrevName(p.name)) : "—"}${p && p.injury ? injBadge(p) : ""}</span><span class="pg-slot-v">${p ? fmtVal(p.value || 0) : ""}</span></div>`; }).join("")}
+        <div class="pg-slot total"><span></span><span class="pg-slot-n">Starters</span><span class="pg-slot-v">${fmtVal(st.starters)}</span></div></div>`;
+    const byeLine = st => Object.keys(st.byes).sort((a, b) => a - b).map(w => `<span class="${st.byes[w].length >= 3 ? "d-down" : ""}">wk${w}: ${st.byes[w].length}</span>`).join(" · ") || "none";
+    const tags = pr => pr.need.map(p => `<span class="mini need ${posClass(p)}">thin ${p}</span>`).join("") + pr.has.map(p => `<span class="mini has ${posClass(p)}">deep ${p}</span>`).join("") || `<span class="pt-lbl">balanced</span>`;
+    const groups = POS_ORDER.map(pos => {
+      const list = roster.filter(p => posLabel(p.pos) === pos).sort((x, y) => (y.value || 0) - (x.value || 0));
+      if (!list.length) return "";
+      return `<div class="tp-grp">${posBadge(pos)} <span>${list.length}</span></div>` + list.map(p => {
+        const added = !baseK.has(pkey(p));
+        const meta = [p.pos_rank != null ? posRankStr(p) : "", p.ppg != null ? `${p.ppg} ppg` : "", p.projected != null ? `proj ${Number(p.projected).toFixed(1)}` : "", p.bye ? `bye ${p.bye}` : ""].filter(Boolean);
+        return `<div class="tp pg-row ${added ? "added" : ""}" data-key="${esc(pkey(p))}">
+            <span class="tp-add pg-x" title="Remove from playground">✕</span>
+            <span class="tp-mid"><div class="tp-name">${teamLogo(p.team)}<span class="pm-open" ${pdata(p)}>${esc(p.name)}</span>${injBadge(p)}${added ? `<span class="slot" style="color:var(--win);border-color:var(--win)">NEW</span>` : ""}${aS.has(pkey(p)) ? `<span class="slot">starter</span>` : ""}</div>
+              <div class="tp-meta">${meta.map(m => `<span>${esc(m)}</span>`).join("")}${trendArrow(p.trend)}</div></span>
+            <span class="tp-right"><div class="tp-val ${p.value == null ? "dim" : ""}">${p.value == null ? "—" : fmtVal(p.value)}</div></span></div>`;
+      }).join("");
+    }).join("");
+    const removed = base.filter(p => !afterK.has(pkey(p)));
+    host.innerHTML = `<div class="panel pg">
+      <div class="panel-h"><span>🧪 Playground · ${esc(me.name)}</span>
+        <span class="vactions"><button class="ghost" id="pgLoadDeal">⇄ Apply deal on the board</button><button class="ghost" id="pgReset" ${edited ? "" : "disabled"}>↺ Reset to my real roster</button></span></div>
+      <div class="pg-body">
+        <div class="pg-left">
+          <div class="pg-search"><input type="text" id="pgQ" placeholder="🔍 Add any NFL player…" value="${esc(PG.q)}" autocomplete="off">
+            <div class="pm-results pg-results" id="pgRes" ${PG.results.length ? "" : "hidden"}>${PG.results.map(r => `<div class="pm-result" data-sid="${esc(r.sleeper_id)}" data-eid="${esc(r.espn_id)}" data-name="${esc(r.name)}" data-team="${esc(r.team)}" data-pos="${esc(r.pos)}">${posBadge(r.pos)} <span class="pmr-name">${esc(r.name)}</span> <small>${esc(r.team)}</small></div>`).join("")}</div></div>
+          <div class="pg-count ${after.count > limit ? "d-down" : ""}">${after.count} / ${limit} roster spots${after.count > limit ? ` · ${after.count - limit} over — you'd need to drop` : ""}${removed.length ? ` · removed: ${removed.map(p => esc(abbrevName(p.name))).join(", ")}` : ""}</div>
+          <div class="tc-roster pg-roster">${groups || `<div class="empty">Empty roster — add players above.</div>`}</div>
+        </div>
+        <div class="pg-right">
+          <div class="pg-cmp">
+            <div class="imp"><div class="imp-h"><span>Before → After</span><span>${edited ? "edited" : "unchanged"}</span></div>
+              <div class="imp-row"><span>Roster value</span><b>${fmtVal(before.total)} → ${fmtVal(after.total)} ${d(before.total, after.total)}</b></div>
+              <div class="imp-row"><span>Starting lineup value</span><b>${fmtVal(before.starters)} → ${fmtVal(after.starters)} ${d(before.starters, after.starters)}</b></div>
+              <div class="imp-row"><span>This week's projected starters</span><b>${before.proj.toFixed(1)} → ${after.proj.toFixed(1)} ${d(before.proj, after.proj, x => x.toFixed(1))}</b></div>
+              <div class="imp-row"><span>Roster spots</span><b>${before.count} → ${after.count}${after.count > limit ? ` <span class="d-down">(${after.count - limit} over)</span>` : ""}</b></div>
+              <div class="imp-row"><span>Positions · before</span><span>${tags(before.profile)}</span></div>
+              <div class="imp-row"><span>Positions · after</span><span>${tags(after.profile)}</span></div>
+              <div class="imp-row"><span>Byes · before</span><span class="pt-lbl">${byeLine(before)}</span></div>
+              <div class="imp-row"><span>Byes · after</span><span class="pt-lbl">${byeLine(after)}</span></div>
+            </div>
+            <div class="pg-lineups">${lineupCol(before, aS, "Before")}${lineupCol(after, bS, "After")}</div>
+          </div>
+          <div class="lab-note">Add anyone in the NFL (free agents, other teams' players) or remove your own to see how the lineup and depth change. Values and projections are matched to this league's format. Nothing here touches your real roster; it's saved in your browser per league.</div>
+        </div>
+      </div></div>`;
+    const q = host.querySelector("#pgQ"), res = host.querySelector("#pgRes");
+    let timer = null;
+    q.addEventListener("input", () => {
+      PG.q = q.value; clearTimeout(timer);
+      const term = q.value.trim();
+      if (term.length < 2) { PG.results = []; res.hidden = true; return; }
+      timer = setTimeout(async () => {
+        try {
+          const r = await fetch("/api/search?q=" + encodeURIComponent(term), { cache: "no-store" });
+          const have = new Set(roster.map(pkey));
+          PG.results = ((await r.json()).results || []).filter(x => !have.has(String(x.sleeper_id)));
+          res.innerHTML = PG.results.length ? PG.results.map(r2 => `<div class="pm-result" data-sid="${esc(r2.sleeper_id)}" data-eid="${esc(r2.espn_id)}" data-name="${esc(r2.name)}" data-team="${esc(r2.team)}" data-pos="${esc(r2.pos)}">${posBadge(r2.pos)} <span class="pmr-name">${esc(r2.name)}</span> <small>${esc(r2.team)}</small></div>`).join("") : `<div class="pm-result empty">No players found</div>`;
+          res.hidden = false;
+        } catch (e) { res.hidden = true; }
+      }, 200);
+    });
+    res.addEventListener("click", async e => {
+      const row = e.target.closest(".pm-result"); if (!row || !row.dataset.name || PG.busy) return;
+      PG.busy = true; row.innerHTML = `<span class="spin"></span>Adding ${esc(row.dataset.name)}…`;
+      try {
+        const qs = new URLSearchParams({ id: T.leagueId, sleeper_id: row.dataset.sid || "", espn_id: row.dataset.eid || "", name: row.dataset.name, team: row.dataset.team || "", pos: row.dataset.pos || "" });
+        const r = await fetch("/api/player/card?" + qs, { cache: "no-store" });
+        const card = await r.json();
+        if (card.error) throw new Error(card.error);
+        pgApply([], [card]); PG.q = ""; PG.results = [];
+        toast(`${card.name} added to the playground`);
+      } catch (err) { toast("Could not add player: " + (err.message || err)); }
+      PG.busy = false; renderPlayground(host);
+    });
+    host.querySelectorAll(".pg-x").forEach(x => x.addEventListener("click", e => {
+      e.stopPropagation();
+      const key = x.closest(".pg-row").dataset.key;
+      pgLoad(); PG.roster = (PG.roster || pgBase().map(p => ({ ...p }))).filter(p => pkey(p) !== key); pgSave(); renderPlayground(host);
+    }));
+    host.querySelector("#pgReset").addEventListener("click", () => { PG.roster = null; store.set("pg:" + T.leagueId, null); renderPlayground(host); });
+    host.querySelector("#pgLoadDeal").addEventListener("click", () => {
+      const A = team("a"), B = team("b"), give = selected("a"), get = selected("b");
+      if (!give.length && !get.length) { toast("Build a deal on the board first"); return; }
+      if (A !== me && B !== me) { toast("Put your own team on one side of the deal first"); return; }
+      pgApply(A === me ? give : get, A === me ? get : give); renderPlayground(host);
+    });
+    document.addEventListener("click", e => { if (!e.target.closest(".pg-search")) res.hidden = true; }, { once: true });
   }
 
   /* ---- history ---- */

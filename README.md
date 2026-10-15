@@ -60,8 +60,9 @@ profiles open in a tabbed window from anywhere.
 - **Trade partners rail** — every team ranked by how well their surplus fits your needs (and vice-versa), with needs/depth tags.
 - **Finder** — balanced swaps with one partner, a **whole-league scan** (1-for-1, 2-for-1, 1-for-2), or offers for your **★ trade block**; filters for fairness band, "must upgrade my starters", fill-my-needs, target positions, positions to keep out, and **🔒 untouchables**.
 - **AI analyst** — evaluates the deal on the board (grades, verdict, what each side gets, risks, lineup impact, a counter-offer you can load with one click, and a ready-to-send pitch), **suggests trades** across the league, or **chats** — "Ask the analyst" is a running conversation per league (saved in your browser) so you can follow up, and every message re-reads the latest league data. Requests keep running while you browse other views; results and chats stay with their league. It's given everything the app knows: league format, standings with playoff odds, schedule and this week's matchups, power rankings, trade history, waivers and trending adds, buy-low / sell-high trends, Vegas edges, byes, every roster with values, season stats and usage, injuries with notes, Vegas props, plus news, outlooks and recent games for the key players (including any player you mention in a question). Every answer includes a **"What the analyst saw"** panel showing the exact data it was sent. Works with your **Claude or ChatGPT account** (via the Claude Code / Codex CLI — no API key) or an Anthropic / OpenAI / OpenAI-compatible API key.
+- **Playground** — edit a copy of your roster freely: add any NFL player (free agents, other teams' guys) or remove your own, or apply the deal on the board, and see before → after side by side: roster value, starting-lineup value, this week's projected starters, roster spots vs the league limit, positional strengths, bye-week clusters, and the two optimal lineups with changed slots highlighted. Never touches your real team.
 - **League trade history** (completed trades this season), **saved proposals**, and a one-click **copy for league chat**.
-- Trade values, ranks, and 30-day trends via [FantasyCalc](https://fantasycalc.com).
+- Trade values, ranks, and value **trends** via [FantasyCalc](https://fantasycalc.com) — the trend window is adjustable in ⚙ Settings (3, 7, 14 or 30 days) and applies everywhere a ▲/▼ trend appears, including Buy-low / Sell-high and the AI analyst.
 
 ---
 
@@ -114,10 +115,10 @@ Click **⚙** in the app and pick how to connect:
   ```bash
   codex login
   ```
-  The app uses `gpt-5.5` by default; change the model in ⚙ if your plan offers a different one.
+  Pick a model from the dropdown in ⚙ (the list comes from Codex itself; "Auto" tries them until one your plan accepts).
 - **API key** — Anthropic, OpenAI, or any OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter…).
 
-Neither account option needs an API key. Settings are saved to the `ai` block of your local
+Neither account option needs an API key; usage counts against that subscription (the Settings screen shows which account and plan each CLI is signed in to). Settings are saved to the `ai` block of your local
 `config.json` (API keys can also come from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`). League data is
 sent to the provider you picked only when you press an AI button; an analysis typically takes
 20–60 seconds.
