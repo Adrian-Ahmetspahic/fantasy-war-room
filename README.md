@@ -68,23 +68,46 @@ profiles open in a tabbed window from anywhere.
 
 ## Setup (about 2 minutes, one time)
 
-You need `python3` (already installed on macOS/Linux; on Windows install from python.org).
+Works on **macOS, Linux and Windows**. The only requirement is **Python 3.9+** — nothing to `pip install`.
+
+| | Python | Open a terminal |
+|---|---|---|
+| **macOS** | Already installed (`python3`). | Terminal (⌘ Space → "Terminal") |
+| **Linux** | Usually installed (`python3`); otherwise `sudo apt install python3` (Debian/Ubuntu) or `sudo dnf install python3` (Fedora). | Your terminal app |
+| **Windows** | Install from [python.org](https://www.python.org/downloads/) and tick **"Add python.exe to PATH"** (or `winget install Python.Python.3.12`). Use `python` (or `py`) where the steps say `python3`. | PowerShell (Start → "PowerShell") |
+
+**0. Get the code**
+
+```bash
+git clone https://github.com/Adrian-Ahmetspahic/fantasy-war-room.git
+cd fantasy-war-room
+```
+
+(No git? Use **Code → Download ZIP** on GitHub, unzip it, and open a terminal in that folder.)
 
 **1. Create your config**
+
+macOS / Linux:
 
 ```bash
 cp config.example.json config.json
 ```
 
-Open `config.json` and fill it in:
+Windows (PowerShell):
+
+```powershell
+Copy-Item config.example.json config.json
+```
+
+Open `config.json` in any text editor and fill it in:
 
 - **Sleeper** — just put your Sleeper **username** under `sleeper.username`. The app
   finds your leagues automatically. (To pin specific leagues instead, leave `username`
   and list `league_ids`.)
 - **ESPN** — for each ESPN league add its `league_id` plus two cookies from your
   logged-in ESPN session, `espn_s2` and `SWID`:
-  1. Go to `https://fantasy.espn.com` in Chrome, logged in.
-  2. Open DevTools (`⌥⌘I` / `F12`) → **Application** tab → **Storage → Cookies → `https://fantasy.espn.com`**.
+  1. Go to `https://fantasy.espn.com` in Chrome/Edge/Firefox, logged in.
+  2. Open DevTools (`F12`, or `⌥⌘I` on a Mac) → **Application** tab (Firefox: **Storage**) → **Cookies → `https://fantasy.espn.com`**.
   3. Copy the value of **`espn_s2`** into `espn_s2`, and **`SWID`** (keep the `{ }`) into `swid`.
   4. `league_id` is the `leagueId=` number in your ESPN league URL. The same cookies work for all your ESPN leagues.
 
@@ -92,36 +115,66 @@ Open `config.json` and fill it in:
 
 **2. Run it**
 
+macOS / Linux:
+
 ```bash
 python3 server.py
 ```
 
+Windows:
+
+```powershell
+python server.py
+```
+
 Open **http://localhost:8787** in your browser. Leave the terminal running during
-games; press `Ctrl+C` to stop. Use a different port with `PORT=9000 python3 server.py`.
+games; press `Ctrl+C` to stop. The server only listens on your own machine (127.0.0.1).
+
+To use a different port: `PORT=9000 python3 server.py` (macOS/Linux) or
+`$env:PORT=9000; python server.py` (PowerShell).
 
 **3. (Optional) Turn on the AI trade analyst**
 
 Click **⚙** in the app and pick how to connect:
 
 - **Claude account** — uses the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
-  signed in on your machine. Install with `npm i -g @anthropic-ai/claude-code`, then sign in once:
+  signed in on your machine; no API key. Needs [Node.js](https://nodejs.org) 18+ (any OS), then:
+
+  ```bash
+  npm install -g @anthropic-ai/claude-code
+  ```
+  and sign in once:
 
   ```bash
   claude auth login
   ```
 - **ChatGPT account** — uses the [Codex CLI](https://github.com/openai/codex) signed in with
-  ChatGPT. Install with `npm i -g @openai/codex`, then sign in once:
+  ChatGPT; no API key. Also needs Node.js 18+, then:
+
+  ```bash
+  npm install -g @openai/codex
+  ```
+  and sign in once:
 
   ```bash
   codex login
   ```
   Pick a model from the dropdown in ⚙ (the list comes from Codex itself; "Auto" tries them until one your plan accepts).
-- **API key** — Anthropic, OpenAI, or any OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter…).
+- **API key** — Anthropic, OpenAI, or any OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter…). No Node needed.
 
-Neither account option needs an API key; usage counts against that subscription (the Settings screen shows which account and plan each CLI is signed in to). Settings are saved to the `ai` block of your local
-`config.json` (API keys can also come from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`). League data is
-sent to the provider you picked only when you press an AI button; an analysis typically takes
-20–60 seconds.
+Neither account option needs an API key; usage counts against that subscription (the Settings
+screen shows which account and plan each CLI is signed in to). Settings are saved to the `ai`
+block of your local `config.json` (API keys can also come from the `ANTHROPIC_API_KEY` /
+`OPENAI_API_KEY` environment variables). League data is sent to the provider you picked only
+when you press an AI button; an analysis typically takes 20–60 seconds.
+
+**Updating later**
+
+```bash
+git pull
+```
+
+then restart `server.py`. Your `config.json` is untouched by updates.
 
 ---
 
